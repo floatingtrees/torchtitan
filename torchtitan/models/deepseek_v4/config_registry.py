@@ -3,13 +3,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtitan.components.loss import ChunkedCELoss, CrossEntropyLoss
+from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import default_adamw
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.config import (
-    ActivationCheckpointConfig,
     CompileConfig,
     ParallelismConfig,
     TrainingConfig,
@@ -49,7 +48,7 @@ def deepseek_v4_debugmodel() -> Trainer.Config:
         parallelism=ParallelismConfig(
             expert_parallel_degree=1,
         ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="none"),
+        activation_checkpoint=None,
         compile=CompileConfig(enable=False),
         checkpoint=CheckpointManager.Config(
             enable=False,

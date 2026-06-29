@@ -291,7 +291,6 @@ def _make_v4_moe_config(
     load_balance_coeff: float,
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None,
-    score_before_experts: bool = False,
 ):
     return DeepSeekV4MoE.Config(
         num_experts=num_experts,
@@ -317,7 +316,6 @@ def _make_v4_moe_config(
             num_experts=num_experts,
             top_k=top_k,
             param_init=_depth_experts_init(layer_id),
-            score_before_experts=score_before_experts,
             comm_backend=moe_comm_backend,
             non_blocking_capacity_factor=non_blocking_capacity_factor,
         ),
@@ -331,7 +329,7 @@ def _make_v4_moe_config(
             if num_shared_experts > 0
             else None
         ),
-        load_balance_coeff=load_balance_coeff if layer_id >= n_hash_layers else None,
+        load_balance_coeff=load_balance_coeff,
     )
 
 
@@ -378,7 +376,6 @@ def _build_v4_layers(
     non_blocking_capacity_factor: float | None,
     rope: RoPE.Config,
     rope_compress: RoPE.Config,
-    score_before_experts: bool = False,
     hc_mult: int = 4,
     sinkhorn_iters: int = 20,
     hc_eps: float = 1e-6,
@@ -436,7 +433,6 @@ def _build_v4_layers(
                 load_balance_coeff=load_balance_coeff,
                 moe_comm_backend=moe_comm_backend,
                 non_blocking_capacity_factor=non_blocking_capacity_factor,
-                score_before_experts=score_before_experts,
             )
 
         layers.append(
@@ -542,7 +538,6 @@ def _debugmodel(
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         rope=rope,
         rope_compress=rope_compress,
-        score_before_experts=False,
         hc_mult=hc_mult,
         sinkhorn_iters=sinkhorn_iters,
         hc_eps=hc_eps,

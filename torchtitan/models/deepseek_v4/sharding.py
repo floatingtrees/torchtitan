@@ -231,12 +231,11 @@ def set_deepseek_v4_layer_sharding(
 def set_deepseek_v4_sharding_config(
     config: "DeepSeekV4Model.Config",
     *,
-    loss_parallel: bool,
     enable_sp: bool,
     enable_ep: bool,
 ) -> None:
     set_decoder_sharding_config(
-        config, loss_parallel=loss_parallel, enable_sp=enable_sp
+        config, enable_sp=enable_sp
     )
 
     hc_rep = ShardingConfig(

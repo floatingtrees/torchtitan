@@ -43,23 +43,20 @@ class DSAFlexAttention(FlexAttention):
         kv_len: int,
         device,
     ):
-        sink_idx = kv_len
-
         def window_mask_mod(b, h, q_idx, kv_idx):
             in_window = (
                 (kv_idx < seqlen)
                 & (kv_idx <= q_idx)
                 & (q_idx - kv_idx < self.window_size)
             )
-            is_sink = kv_idx == sink_idx
-            return in_window | is_sink
+            return in_window
 
         return create_attention_mask(
             window_mask_mod,
             bsz,
             None,
             seqlen,
-            kv_len + 1,
+            kv_len,
             device=device,
             BLOCK_SIZE=self.block_size,
             separate_full_blocks=False,
@@ -75,7 +72,6 @@ class DSAFlexAttention(FlexAttention):
         device,
     ):
         compress_len = seqlen // self.compress_ratio
-        sink_idx = kv_len
         topk = compress_topk_idxs.size(-1)
 
         def v4_sparse_mask_mod(b, h, q_idx, kv_idx):
@@ -94,15 +90,14 @@ class DSAFlexAttention(FlexAttention):
                 & (kv_idx < seqlen + compress_len)
                 & selected_compress
             )
-            is_sink = kv_idx == sink_idx
-            return in_window | in_compressed_topk | is_sink
+            return in_window | in_compressed_topk
 
         return create_attention_mask(
             v4_sparse_mask_mod,
             bsz,
             None,
             seqlen,
-            kv_len + 1,
+            kv_len,
             device=device,
             BLOCK_SIZE=self.block_size,
             separate_full_blocks=False,
@@ -117,7 +112,6 @@ class DSAFlexAttention(FlexAttention):
         device,
     ):
         compress_len = seqlen // self.compress_ratio
-        sink_idx = kv_len
 
         def compress_causal_mask_mod(b, h, q_idx, kv_idx):
             in_window = (
@@ -131,15 +125,14 @@ class DSAFlexAttention(FlexAttention):
                 & (kv_idx < seqlen + compress_len)
                 & (compress_idx < (q_idx + 1) // self.compress_ratio)
             )
-            is_sink = kv_idx == sink_idx
-            return in_window | in_compressed_causal | is_sink
+            return in_window | in_compressed_causal
 
         return create_attention_mask(
             compress_causal_mask_mod,
             bsz,
             None,
             seqlen,
-            kv_len + 1,
+            kv_len,
             device=device,
             BLOCK_SIZE=self.block_size,
             separate_full_blocks=False,
@@ -163,8 +156,6 @@ class DSAFlexAttention(FlexAttention):
             kv_states = torch.cat([kv_states, kv_compress], dim=1)
         kv_len = kv_states.size(1)
 
-        sink_kv = kv_states.new_zeros((bsz, 1, head_dim))
-        kv_states = torch.cat([kv_states, sink_kv], dim=1)
         key_value_states = kv_states.unsqueeze(2)
 
         if self.compress_ratio == 4:
@@ -193,19 +184,34 @@ class DSAFlexAttention(FlexAttention):
                 kv_len=kv_len,
                 device=query_states.device,
             )
-        sink_idx = kv_len
 
-        def v4_sink_score_mod(score, b, h, q_idx, kv_idx):
-            return torch.where(kv_idx == sink_idx, attn_sink[h], score)
+        # Apply the attention sink correction outside of flex attention.
+        # The sink token has v=0, so it contributes nothing to the numerator —
+        # it only steals softmax mass from real tokens. The corrected output is:
+        #   out_corrected = out * sigmoid(logsumexp - attn_sink[h])
+        # where logsumexp is the log-sum-exp of scores over real tokens (no sink),
+        # and attn_sink[h] is the learned sink logit per head.
+        # This is mathematically equivalent to including a sink token with v=0
+        # and score=attn_sink[h] in the softmax.
+        sink_logit = attn_sink  # (n_heads,)
+
+        def sink_correction(out_BLNH, lse_BLN):
+            # out_BLNH: (bsz, seqlen, n_heads, head_dim)
+            # lse_BLN: (bsz, seqlen, n_heads) in float32
+            # sink_logit: (n_heads,) in bfloat16
+            correction = torch.sigmoid(
+                lse_BLN - sink_logit.float()[None, None, :]
+            )
+            return out_BLNH * correction.to(out_BLNH.dtype).unsqueeze(-1)
 
         return super().forward(
             query_states,
             key_value_states,
             key_value_states,
             attention_masks=block_mask,
-            score_mod=v4_sink_score_mod,
             scale=self.softmax_scale,
             enable_gqa=True,
+            out_transform=sink_correction,
         )
 
 

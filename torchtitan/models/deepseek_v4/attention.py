@@ -9,11 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from torchtitan.models.common.attention import (
-    BaseAttention,
-    create_attention_mask,
-    FlexAttention,
-)
+from torchtitan.models.common.attention import BaseAttention
 from torchtitan.models.common.nn_modules import Linear, RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
@@ -21,129 +17,25 @@ from torchtitan.protocols.module import Module
 from .compressor import Compressor, Indexer
 
 
-class DSAFlexAttention(FlexAttention):
+class DSAFlexAttention(Module):
+    """Gather-based sparse attention for DeepSeek V4.
+
+    Replaces FlexAttention with explicit gather/scatter ops and standard
+    softmax over the sparse window + compressed tokens.
+    """
+
     @dataclass(kw_only=True, slots=True)
-    class Config(FlexAttention.Config):
+    class Config(Module.Config):
         window_size: int
         compress_ratio: int
         softmax_scale: float
+        block_size: int = 128  # unused, kept for config compat
 
     def __init__(self, config: Config) -> None:
-        super().__init__(config)
+        super().__init__()
         self.window_size = config.window_size
         self.compress_ratio = config.compress_ratio
         self.softmax_scale = config.softmax_scale
-        self.block_size = config.block_size
-
-    def _create_window_mask(
-        self,
-        *,
-        bsz: int,
-        seqlen: int,
-        kv_len: int,
-        device,
-    ):
-        sink_idx = kv_len
-
-        def window_mask_mod(b, h, q_idx, kv_idx):
-            in_window = (
-                (kv_idx < seqlen)
-                & (kv_idx <= q_idx)
-                & (q_idx - kv_idx < self.window_size)
-            )
-            is_sink = kv_idx == sink_idx
-            return in_window | is_sink
-
-        return create_attention_mask(
-            window_mask_mod,
-            bsz,
-            None,
-            seqlen,
-            kv_len + 1,
-            device=device,
-            BLOCK_SIZE=self.block_size,
-            separate_full_blocks=False,
-        )
-
-    def _create_indexer_block_causal_mask(
-        self,
-        *,
-        compress_topk_idxs: torch.Tensor,
-        bsz: int,
-        seqlen: int,
-        kv_len: int,
-        device,
-    ):
-        compress_len = seqlen // self.compress_ratio
-        sink_idx = kv_len
-        topk = compress_topk_idxs.size(-1)
-
-        def v4_sparse_mask_mod(b, h, q_idx, kv_idx):
-            in_window = (
-                (kv_idx < seqlen)
-                & (kv_idx <= q_idx)
-                & (q_idx - kv_idx < self.window_size)
-            )
-            selected_compress = compress_topk_idxs[b, q_idx, 0] == kv_idx
-            for idx in range(1, topk):
-                selected_compress = selected_compress | (
-                    compress_topk_idxs[b, q_idx, idx] == kv_idx
-                )
-            in_compressed_topk = (
-                (kv_idx >= seqlen)
-                & (kv_idx < seqlen + compress_len)
-                & selected_compress
-            )
-            is_sink = kv_idx == sink_idx
-            return in_window | in_compressed_topk | is_sink
-
-        return create_attention_mask(
-            v4_sparse_mask_mod,
-            bsz,
-            None,
-            seqlen,
-            kv_len + 1,
-            device=device,
-            BLOCK_SIZE=self.block_size,
-            separate_full_blocks=False,
-        )
-
-    def _create_compress_causal_mask(
-        self,
-        *,
-        bsz: int,
-        seqlen: int,
-        kv_len: int,
-        device,
-    ):
-        compress_len = seqlen // self.compress_ratio
-        sink_idx = kv_len
-
-        def compress_causal_mask_mod(b, h, q_idx, kv_idx):
-            in_window = (
-                (kv_idx < seqlen)
-                & (kv_idx <= q_idx)
-                & (q_idx - kv_idx < self.window_size)
-            )
-            compress_idx = kv_idx - seqlen
-            in_compressed_causal = (
-                (kv_idx >= seqlen)
-                & (kv_idx < seqlen + compress_len)
-                & (compress_idx < (q_idx + 1) // self.compress_ratio)
-            )
-            is_sink = kv_idx == sink_idx
-            return in_window | in_compressed_causal | is_sink
-
-        return create_attention_mask(
-            compress_causal_mask_mod,
-            bsz,
-            None,
-            seqlen,
-            kv_len + 1,
-            device=device,
-            BLOCK_SIZE=self.block_size,
-            separate_full_blocks=False,
-        )
 
     def forward(
         self,
@@ -153,60 +45,70 @@ class DSAFlexAttention(FlexAttention):
         kv_compress,
         compress_topk_idxs,
     ):
-        if self.compress_ratio > 1 and kv_compress is None:
-            raise ValueError(
-                "DSAFlexAttention requires kv_compress when compress_ratio > 1"
+        bsz, seqlen, n_heads, head_dim = query_states.size()
+
+        # Build window indices: each query attends to its preceding window_size tokens
+        # topk_idxs: (seqlen, window_size)
+        base = torch.arange(seqlen, device=query_states.device).unsqueeze(1)
+        window_offsets = torch.arange(
+            min(seqlen, self.window_size), device=query_states.device
+        )
+        window_topk = (base - self.window_size + 1).clamp(0) + window_offsets
+        # Mark positions beyond the query as invalid (-1)
+        window_topk = torch.where(window_topk > base, -1, window_topk)
+        # Expand to batch: (bsz, seqlen, window_size)
+        topk_idxs = window_topk.unsqueeze(0).expand(bsz, -1, -1)
+
+        # Append compressed token indices if compress_ratio > 1
+        if self.compress_ratio > 1 and compress_topk_idxs.size(-1) > 0:
+            topk_idxs = torch.cat(
+                [topk_idxs, compress_topk_idxs.to(topk_idxs.device)], dim=-1
             )
 
-        bsz, seqlen, _, head_dim = query_states.size()
-        if self.compress_ratio > 1:
+        # Concatenate kv with compressed kv
+        if self.compress_ratio > 1 and kv_compress.size(1) > 0:
             kv_states = torch.cat([kv_states, kv_compress], dim=1)
+
         kv_len = kv_states.size(1)
 
-        sink_kv = kv_states.new_zeros((bsz, 1, head_dim))
-        kv_states = torch.cat([kv_states, sink_kv], dim=1)
-        key_value_states = kv_states.unsqueeze(2)
+        # Pad KV with one zero token at end for invalid index mapping
+        kv_padded = F.pad(kv_states, (0, 0, 0, 1))  # (B, kv_len+1, D)
 
-        if self.compress_ratio == 4:
-            if compress_topk_idxs is None:
-                raise ValueError(
-                    "DSAFlexAttention block causal mask requires compress_topk_idxs"
-                )
-            block_mask = self._create_indexer_block_causal_mask(
-                compress_topk_idxs=compress_topk_idxs,
-                bsz=bsz,
-                seqlen=seqlen,
-                kv_len=kv_len,
-                device=query_states.device,
-            )
-        elif self.compress_ratio > 1:
-            block_mask = self._create_compress_causal_mask(
-                bsz=bsz,
-                seqlen=seqlen,
-                kv_len=kv_len,
-                device=query_states.device,
-            )
-        else:
-            block_mask = self._create_window_mask(
-                bsz=bsz,
-                seqlen=seqlen,
-                kv_len=kv_len,
-                device=query_states.device,
-            )
-        sink_idx = kv_len
-
-        def v4_sink_score_mod(score, b, h, q_idx, kv_idx):
-            return torch.where(kv_idx == sink_idx, attn_sink[h], score)
-
-        return super().forward(
-            query_states,
-            key_value_states,
-            key_value_states,
-            attention_masks=block_mask,
-            score_mod=v4_sink_score_mod,
-            scale=self.softmax_scale,
-            enable_gqa=True,
+        # Map invalid positions (-1) to the pad token index
+        topk_idxs = topk_idxs.where(
+            topk_idxs >= 0, torch.tensor(kv_len, device=topk_idxs.device)
         )
+        # topk_idxs: (B, S, W)
+        W = topk_idxs.shape[-1]
+
+        # Gather KV at sparse positions: (B, S*W, D) -> (B, S, W, D)
+        idx_flat = topk_idxs.long().reshape(bsz, -1)
+        idx_expanded = idx_flat.unsqueeze(-1).expand(-1, -1, head_dim)
+        kv_gathered = torch.gather(kv_padded, 1, idx_expanded)
+        kv_gathered = kv_gathered.reshape(bsz, seqlen, W, head_dim)
+
+        # Compute attention scores: Q @ K_gathered^T
+        # query_states: (B, S, H, D) -> (B, H, S, D)
+        q = query_states.transpose(1, 2)
+        scores = torch.einsum("bhsd,bswd->bhsw", q, kv_gathered) * self.softmax_scale
+
+        # Mask invalid (pad) positions to -inf
+        invalid_mask = (topk_idxs == kv_len)  # (B, S, W)
+        scores = scores.masked_fill(
+            invalid_mask.unsqueeze(1), torch.finfo(scores.dtype).min
+        )
+
+        # Append sink logit: (B, H, S, 1)
+        sink_logit = attn_sink.reshape(1, -1, 1, 1).expand(bsz, n_heads, seqlen, 1)
+        combined = torch.cat([scores, sink_logit], dim=-1)  # (B, H, S, W+1)
+        probs = F.softmax(combined.float(), dim=-1).to(combined.dtype)
+        attn_probs = probs[..., :-1]  # (B, H, S, W) — drop sink weight (v_sink=0)
+
+        # Weighted sum: (B, H, S, W) @ (B, S, W, D) -> (B, H, S, D)
+        attn_output = torch.einsum("bhsw,bswd->bhsd", attn_probs, kv_gathered)
+        # Back to (B, S, H, D)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output
 
 
 class GetAttnScores(Module):

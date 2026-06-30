@@ -45,70 +45,40 @@ class DSAFlexAttention(Module):
         kv_compress,
         compress_topk_idxs,
     ):
+        from .triton_sparse_attn import triton_sparse_attention
+
         bsz, seqlen, n_heads, head_dim = query_states.size()
 
         # Build window indices: each query attends to its preceding window_size tokens
-        # topk_idxs: (seqlen, window_size)
         base = torch.arange(seqlen, device=query_states.device).unsqueeze(1)
         window_offsets = torch.arange(
             min(seqlen, self.window_size), device=query_states.device
         )
         window_topk = (base - self.window_size + 1).clamp(0) + window_offsets
-        # Mark positions beyond the query as invalid (-1)
         window_topk = torch.where(window_topk > base, -1, window_topk)
-        # Expand to batch: (bsz, seqlen, window_size)
         topk_idxs = window_topk.unsqueeze(0).expand(bsz, -1, -1)
 
-        # Append compressed token indices if compress_ratio > 1
         if self.compress_ratio > 1 and compress_topk_idxs.size(-1) > 0:
             topk_idxs = torch.cat(
                 [topk_idxs, compress_topk_idxs.to(topk_idxs.device)], dim=-1
             )
 
-        # Concatenate kv with compressed kv
         if self.compress_ratio > 1 and kv_compress.size(1) > 0:
             kv_states = torch.cat([kv_states, kv_compress], dim=1)
 
         kv_len = kv_states.size(1)
+        kv_padded = F.pad(kv_states, (0, 0, 0, 1))
 
-        # Pad KV with one zero token at end for invalid index mapping
-        kv_padded = F.pad(kv_states, (0, 0, 0, 1))  # (B, kv_len+1, D)
-
-        # Map invalid positions (-1) to the pad token index
         topk_idxs = topk_idxs.where(
             topk_idxs >= 0, torch.tensor(kv_len, device=topk_idxs.device)
         )
-        # topk_idxs: (B, S, W)
         W = topk_idxs.shape[-1]
 
-        # Gather KV at sparse positions: (B, S*W, D) -> (B, S, W, D)
-        idx_flat = topk_idxs.long().reshape(bsz, -1)
-        idx_expanded = idx_flat.unsqueeze(-1).expand(-1, -1, head_dim)
-        kv_gathered = torch.gather(kv_padded, 1, idx_expanded)
-        kv_gathered = kv_gathered.reshape(bsz, seqlen, W, head_dim)
-
-        # Compute attention scores: Q @ K_gathered^T
-        # query_states: (B, S, H, D) -> (B, H, S, D)
-        q = query_states.transpose(1, 2)
-        scores = torch.einsum("bhsd,bswd->bhsw", q, kv_gathered) * self.softmax_scale
-
-        # Mask invalid (pad) positions to -inf
-        invalid_mask = (topk_idxs == kv_len)  # (B, S, W)
-        scores = scores.masked_fill(
-            invalid_mask.unsqueeze(1), torch.finfo(scores.dtype).min
+        # Use fused Triton kernel
+        return triton_sparse_attention(
+            query_states, kv_padded, topk_idxs, attn_sink,
+            self.softmax_scale, kv_len, W
         )
-
-        # Append sink logit: (B, H, S, 1)
-        sink_logit = attn_sink.reshape(1, -1, 1, 1).expand(bsz, n_heads, seqlen, 1)
-        combined = torch.cat([scores, sink_logit], dim=-1)  # (B, H, S, W+1)
-        probs = F.softmax(combined.float(), dim=-1).to(combined.dtype)
-        attn_probs = probs[..., :-1]  # (B, H, S, W) — drop sink weight (v_sink=0)
-
-        # Weighted sum: (B, H, S, W) @ (B, S, W, D) -> (B, H, S, D)
-        attn_output = torch.einsum("bhsw,bswd->bhsd", attn_probs, kv_gathered)
-        # Back to (B, S, H, D)
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        return attn_output
 
 
 class GetAttnScores(Module):

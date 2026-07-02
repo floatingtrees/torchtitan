@@ -200,11 +200,9 @@ supported TorchTitan model regions:
   Compile: every TransformerBlock with fullgraph=True, plus the loss
 
 TorchTitan's supported model compile path compiles each TransformerBlock as a
-full graph rather than compiling one monolithic training-step graph. The
-committed debug defaults remain window/top-k 16/16 for the original benchmark
-above. For this rerun, temporarily change window_size and index_topk at
-torchtitan/models/deepseek_v4/__init__.py to 128, run the command below, and
-then restore both values to 16.
+full graph rather than compiling one monolithic training-step graph. The CUDA
+Graph development branches commit window/top-k 128/128, matching this rerun.
+The earlier test branches retain the original 16/16 defaults.
 
 Set BACKEND to flex, gather, or custom, use the matching branch, and use fresh
 cache and output directories:
@@ -268,3 +266,70 @@ Maximum grad norm      4.062500         4.031250          4.062500
 All losses and gradient norms were finite, with bit-identical globally reduced
 metrics across all four ranks. Every rank reported zero OOMs and allocator
 retries.
+
+
+Four-GPU CUDA Graph rerun
+=========================
+
+Branches:
+
+  dev/custom_kernel_cuda_graph
+  dev/allgather_cuda_graph
+
+Both branches include run_train_cuda_graph.sh. It enables CUDA Graphs before
+PyTorch is imported, makes any reported capture skip an error, disables graph
+partition fallback, and enables model/loss compilation. TORCH_LOGS=cudagraphs
+is set below only to record capture diagnostics.
+
+Use the matching branch and set BACKEND to custom or gather:
+
+  BACKEND=custom
+  RUN_DIR="$PWD/outputs/${BACKEND}_cuda_graph_4gpu_100_steps"
+  CACHE_ROOT="$(mktemp -d /tmp/${BACKEND}_cuda_graph_cache.XXXXXX)"
+  mkdir -p "$RUN_DIR"
+
+  CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  NGPU=4 \
+  LOG_RANK=0 \
+  MODULE=deepseek_v4 \
+  CONFIG=deepseek_v4_debugmodel \
+  TORCH_LOGS=cudagraphs \
+  TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/inductor" \
+  TRITON_CACHE_DIR="$CACHE_ROOT/triton" \
+  ./run_train_cuda_graph.sh \
+    --parallelism.data_parallel_replicate_degree 1 \
+    --parallelism.data_parallel_shard_degree 4 \
+    --parallelism.tensor_parallel_degree 1 \
+    --parallelism.context_parallel_degree 1 \
+    --parallelism.pipeline_parallel_degree 1 \
+    --parallelism.expert_parallel_degree 1 \
+    --training.local_batch_size 8 \
+    --training.global_batch_size 32 \
+    --training.seq_len 2048 \
+    --training.steps 100 \
+    --training.dtype bfloat16 \
+    --debug.seed 42 \
+    --metrics.enable-tensorboard \
+    --metrics.save-for-all-ranks \
+    --metrics.log-freq 1 \
+    --metrics.save-tb-folder tb \
+    --dump-folder "$RUN_DIR" \
+    > "$RUN_DIR/train.log" 2>&1
+
+A valid strict run records ten functions on rank 0: four TransformerBlock
+forwards, loss forward/backward, and four TransformerBlock backwards.
+
+  test "$(rg -c 'Recording function=call' "$RUN_DIR/train.log")" -eq 10
+  ! rg 'skipping cudagraph|Re-recording' "$RUN_DIR/train.log"
+
+For timing, take the maximum step_end duration across ranks for every step.
+Use steps 11-100 and exclude the steps carrying the gc tag (50 and 100). Model
+TFLOP/s/GPU is 7559.174651904 divided by the critical-rank mean in milliseconds.
+
+Backend          Mean ms/step   Model TFLOP/s/GPU   Peak reserved/GPU
+Custom Triton        51.754            146.06              4.709 GiB
+Compiled gather      55.400            136.45             11.938 GiB
+
+Custom loss was 8.19627 at step 1 and 2.73114 at step 100. Gather loss was
+8.19627 at step 1 and 2.73109 at step 100. All losses and gradient norms were
+finite; neither run reported an OOM or allocator retry.

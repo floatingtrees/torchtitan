@@ -472,11 +472,11 @@ def _debugmodel(
     o_lora_rank = 128
     n_groups = 2
     compress_ratios = (4, 1, 1, 4)
-    window_size = 16
+    window_size = 128
     norm_eps = 1e-6
     index_n_heads = 8
     index_head_dim = 64
-    index_topk = 16
+    index_topk = 128
     moe_inter_dim = 256
     num_experts = 4
     num_shared_experts = 1

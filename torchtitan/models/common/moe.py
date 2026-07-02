@@ -519,6 +519,7 @@ class MoE(Module):
             self.tokens_per_expert_E = torch.zeros(
                 self.experts.num_experts, dtype=torch.float32
             )
+            torch._dynamo.mark_static_address(self.tokens_per_expert_E)
             if self.load_balance_coeff is not None:
                 self.expert_bias_E = torch.zeros(
                     self.experts.num_experts, dtype=torch.float32

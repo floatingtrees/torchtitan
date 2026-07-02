@@ -1,0 +1,117 @@
+DeepSeek-V4 historical dense-matmul attention benchmark
+=======================================================
+
+Branch: test/matmul_attention
+Historical source commit: c2d8a7ab
+
+The historical SparseAttention_1 implementation computes the full dense QK^T
+matrix, scatters a sparse mask over the dense logits, applies softmax, and
+computes the dense probability-value matmul. The sparse indices mask results
+but do not reduce either attention matmul's work.
+
+Configuration
+-------------
+
+Date: 2026-07-02
+GPU: 4 NVIDIA GB200 GPUs, 184.30 GiB each
+PyTorch: 2.14.0a0+gita020fd1
+Dataset: local tests/assets/c4_test C4 subset, configured to re-loop
+Model: deepseek_v4_debugmodel
+Parallelism: FSDP shard degree 4; TP/CP/PP/EP disabled
+Local/global batch size: 8 per GPU / 32 total
+Sequence length: 2048
+Attention heads/head dimension: 16 / 256
+Window size/index top-k: 128 / 128
+Training dtype: bfloat16
+Steps: 100
+Seed: 42
+Compile: every TransformerBlock with fullgraph=True, plus the loss
+
+The committed debug defaults remain window_size=16 and index_topk=16. Before
+running, temporarily change both values to 128 in
+torchtitan/models/deepseek_v4/__init__.py. Restore them to 16 afterward.
+
+Run
+---
+
+Use fresh output and compiler-cache directories for a cold run:
+
+  RUN_DIR="$PWD/outputs/matmul_model_compile_4gpu_100_steps"
+  CACHE_ROOT="$(mktemp -d /tmp/matmul_attention_cache.XXXXXX)"
+  mkdir -p "$RUN_DIR"
+
+  CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  NGPU=4 \
+  LOG_RANK=0 \
+  MODULE=deepseek_v4 \
+  CONFIG=deepseek_v4_debugmodel \
+  TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/inductor" \
+  TRITON_CACHE_DIR="$CACHE_ROOT/triton" \
+  /usr/bin/time -f "wall_seconds=%e" -o "$RUN_DIR/wall_time.txt" \
+  ./run_train.sh \
+    --compile.enable \
+    --compile.backend inductor \
+    --parallelism.data_parallel_replicate_degree 1 \
+    --parallelism.data_parallel_shard_degree 4 \
+    --parallelism.tensor_parallel_degree 1 \
+    --parallelism.context_parallel_degree 1 \
+    --parallelism.pipeline_parallel_degree 1 \
+    --parallelism.expert_parallel_degree 1 \
+    --training.local_batch_size 8 \
+    --training.global_batch_size 32 \
+    --training.seq_len 2048 \
+    --training.steps 100 \
+    --training.dtype bfloat16 \
+    --debug.seed 42 \
+    --metrics.enable-tensorboard \
+    --metrics.save-for-all-ranks \
+    --metrics.log-freq 1 \
+    --metrics.save-tb-folder tb \
+    --dump-folder "$RUN_DIR" \
+    > "$RUN_DIR/train.log" 2>&1
+
+Analyze
+-------
+
+  python scripts/analyze_attention_benchmark.py "$RUN_DIR"
+
+Distributed timing uses the maximum step_end duration across ranks for every
+step. Steps 11-100 form the steady window. The analyzer removes a steady-step
+outlier only when it exceeds five times the steady median. In this run that is
+the scheduled Python GC pause at step 50. Peak memory is the maximum CUDA
+reserved-memory metric over all steps and ranks.
+
+Results
+-------
+
+Process wall:                    123.22 s
+Critical-rank 100-step sum:       98.339 s
+Cold step 1:                      88.095 s
+Steps 11-100 mean, including GC: 105.545 ms
+Steps 11-100 median:              86.149 ms
+Steps 11-100 p95:                 96.380 ms
+Step 50 scheduled GC:           1819.923 ms
+GC-clean mean:                    86.282 ms
+GC-clean p95:                     94.904 ms
+Peak reserved per GPU:            17.115 GiB
+
+Numerical validation
+--------------------
+
+First loss:         8.114531
+Final loss:         2.738876
+First-10 mean:      4.746407
+Last-10 mean:       2.747167
+Maximum grad norm:  4.125000
+
+All 100 losses and gradient norms were finite and bit-identical across all
+four ranks. The last-10 mean loss is below the first-10 mean loss. Every rank
+reported zero OOMs and zero allocator retries.
+
+Comparison with matching 4-GPU runs
+-----------------------------------
+
+Backend                  Gather       Custom Triton-op   Dense matmul
+GC-clean mean (ms)         79.725          80.919           86.282
+Steady median (ms)         79.932          79.463           86.149
+Peak reserved/GPU (GiB)    11.721           4.492           17.115

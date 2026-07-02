@@ -177,3 +177,94 @@ Maximum grad norm   3.984375         3.984375          3.984375
 All 100 losses and gradient norms were finite for every backend. Every
 last-10 mean loss is below its first-10 mean loss, and no run reported an OOM
 or allocator retry.
+
+
+Four-GPU whole-model compile rerun
+==================================
+
+This rerun uses the isolated-kernel attention shape while compiling the
+supported TorchTitan model regions:
+
+  GPUs: 4 NVIDIA GB200
+  Parallelism: FSDP shard degree 4; TP/CP/PP/EP disabled
+  Local batch size: 8 per GPU
+  Global batch size: 32
+  Sequence length: 2048
+  Attention heads: 16
+  Attention head dimension: 256
+  Window size: 128
+  Index top-k: 128
+  Training dtype: bfloat16
+  Steps: 100
+  Seed: 42
+  Compile: every TransformerBlock with fullgraph=True, plus the loss
+
+TorchTitan's supported model compile path compiles each TransformerBlock as a
+full graph rather than compiling one monolithic training-step graph. The
+committed debug defaults remain window/top-k 16/16 for the original benchmark
+above. For this rerun, temporarily change window_size and index_topk at
+torchtitan/models/deepseek_v4/__init__.py to 128, run the command below, and
+then restore both values to 16.
+
+Set BACKEND to flex, gather, or custom, use the matching branch, and use fresh
+cache and output directories:
+
+  BACKEND=custom
+  RUN_DIR="$PWD/outputs/${BACKEND}_model_compile_4gpu_100_steps"
+  CACHE_ROOT="$(mktemp -d /tmp/${BACKEND}_model_compile_cache.XXXXXX)"
+  mkdir -p "$RUN_DIR"
+
+  CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  NGPU=4 \
+  LOG_RANK=0 \
+  MODULE=deepseek_v4 \
+  CONFIG=deepseek_v4_debugmodel \
+  TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/inductor" \
+  TRITON_CACHE_DIR="$CACHE_ROOT/triton" \
+  /usr/bin/time -f "wall_seconds=%e" -o "$RUN_DIR/wall_time.txt" \
+  ./run_train.sh \
+    --compile.enable \
+    --compile.backend inductor \
+    --parallelism.data_parallel_replicate_degree 1 \
+    --parallelism.data_parallel_shard_degree 4 \
+    --parallelism.tensor_parallel_degree 1 \
+    --parallelism.context_parallel_degree 1 \
+    --parallelism.pipeline_parallel_degree 1 \
+    --parallelism.expert_parallel_degree 1 \
+    --training.local_batch_size 8 \
+    --training.global_batch_size 32 \
+    --training.seq_len 2048 \
+    --training.steps 100 \
+    --training.dtype bfloat16 \
+    --debug.seed 42 \
+    --metrics.enable-tensorboard \
+    --metrics.save-for-all-ranks \
+    --metrics.log-freq 1 \
+    --metrics.save-tb-folder tb \
+    --dump-folder "$RUN_DIR" \
+    > "$RUN_DIR/train.log" 2>&1
+
+For distributed timing, parse every rank's structured log and use the maximum
+step_end duration across ranks for each step. Steps 11-100 are the steady
+window. Step 50 contains a scheduled Python GC pause of 1.62-1.80 seconds on
+all backends, so both inclusive and GC-clean means are recorded.
+
+Backend             FlexAttention   compiled gather   custom Triton-op
+Process wall (s)        531.22           124.73            118.88
+Cold step 1 (s)         460.808           92.005            86.387
+Steps 11-100 mean (ms)  480.757           98.526            98.027
+Steady median (ms)      457.097           79.932            79.463
+Steady p95 (ms)         521.339           90.682            89.719
+GC-clean mean (ms)      465.666           79.725            80.919
+Peak reserved/GPU GiB     3.711           11.721             4.492
+
+Backend             FlexAttention   compiled gather   custom Triton-op
+First loss             8.196257         8.196262          8.196276
+Final loss             2.730686         2.731591          2.731410
+First-10 mean          4.741273         4.741146          4.741219
+Last-10 mean           2.737881         2.738314          2.738443
+Maximum grad norm      4.062500         4.031250          4.062500
+
+All losses and gradient norms were finite, with bit-identical globally reduced
+metrics across all four ranks. Every rank reported zero OOMs and allocator
+retries.

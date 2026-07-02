@@ -138,6 +138,15 @@ class DSAFlexAttention(Module):
         )
         topk_idxs = topk_idxs.long()
         invalid_mask = topk_idxs == kv_len
+        if torch.compiler.is_compiling():
+            return _gather_sparse_attention_core(
+                query_states,
+                kv_padded,
+                topk_idxs,
+                invalid_mask,
+                attn_sink,
+                self.softmax_scale,
+            )
         return _compiled_gather_sparse_attention_core(
             query_states,
             kv_padded,

@@ -30,7 +30,10 @@ def deepseek_v4_debugmodel() -> Trainer.Config:
             profiler_active=10,
             profiler_warmup=0,
         ),
-        metrics=MetricsProcessor.Config(log_freq=1),
+        metrics=MetricsProcessor.Config(
+            log_freq=1,
+            enable_tensorboard=True,
+        ),
         model_spec=model_registry("debugmodel"),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
         optimizer=default_adamw(lr=8e-4),
@@ -43,8 +46,10 @@ def deepseek_v4_debugmodel() -> Trainer.Config:
         training=TrainingConfig(
             local_batch_size=8,
             seq_len=2048,
-            steps=10,
+            steps=100,
+            dtype="bfloat16",
         ),
+        debug=DebugConfig(seed=42),
         parallelism=ParallelismConfig(
             expert_parallel_degree=1,
         ),
@@ -55,4 +60,3 @@ def deepseek_v4_debugmodel() -> Trainer.Config:
             interval=100,
         ),
     )
-

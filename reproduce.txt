@@ -35,6 +35,10 @@ Seed: 42
 Trainer-wide torch.compile: disabled
 Metrics frequency: every step
 
+These values are the defaults in deepseek_v4_debugmodel on all three test
+branches. The run command below repeats the important values explicitly so the
+benchmark remains reproducible if defaults change later.
+
 The timed runs intentionally do not use --debug.deterministic. That option
 disables FlexAttention max-autotuning and coordinate descent but does not make
 an equivalent change to the other backends, so it biases the timing comparison.

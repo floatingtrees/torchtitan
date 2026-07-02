@@ -951,7 +951,25 @@ def _key_major_backward_kernel(
 
 class SparseAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, kv, sink, kv_comp, indices, ratio, window, scale):
+    @torch.library.triton_op(
+        "torchtitan_deepseek_v4_sparse_attention::forward", mutates_args=()
+    )
+    def _forward_op(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        sink: torch.Tensor,
+        kv_comp: torch.Tensor,
+        indices: torch.Tensor,
+        ratio: int,
+        window: int,
+        scale: float,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         b, length, n, d = q.shape
         mode = 0 if ratio == 1 or kv_comp.shape[1] == 0 else 1 if ratio == 4 else 2
         num_words = triton.cdiv(kv_comp.shape[1], 32) if kv_comp.shape[1] else 0
@@ -973,7 +991,9 @@ class SparseAttention(torch.autograd.Function):
             )
             if indices.shape[-1] > 0:
                 block_topk = triton.next_power_of_2(indices.shape[-1])
-                _build_csa_bitmap_kernel[(b * length,)](
+                torch.library.wrap_triton(_build_csa_bitmap_kernel)[
+                    (b * length,)
+                ](
                     indices,
                     csa_bitmap,
                     csa_max_selected,
@@ -983,7 +1003,9 @@ class SparseAttention(torch.autograd.Function):
                     block_topk=block_topk,
                     num_warps=4,
                 )
-                _build_csa_min_query_kernel[(triton.cdiv(kv_comp.shape[1], 64), b)](
+                torch.library.wrap_triton(_build_csa_min_query_kernel)[
+                    (triton.cdiv(kv_comp.shape[1], 64), b)
+                ](
                     csa_bitmap,
                     csa_min_selected,
                     sequence_length=length,
@@ -1002,7 +1024,7 @@ class SparseAttention(torch.autograd.Function):
         block_rows = block_queries * block_heads
         block_dim = max(16, triton.next_power_of_2(d))
         block_keys = 64 if q.dtype == torch.float32 else (256 if mode == 1 else 64)
-        _blocked_forward_kernel[
+        torch.library.wrap_triton(_blocked_forward_kernel)[
             (triton.cdiv(length, block_queries), b, triton.cdiv(n, block_heads))
         ](
             q,
@@ -1037,6 +1059,26 @@ class SparseAttention(torch.autograd.Function):
             num_warps=8,
             num_stages=3 if mode == 1 else 1,
         )
+        return output, lse, csa_bitmap, csa_max_selected, csa_min_selected
+
+    @staticmethod
+    def forward(ctx, q, kv, sink, kv_comp, indices, ratio, window, scale):
+        (
+            output,
+            lse,
+            csa_bitmap,
+            csa_max_selected,
+            csa_min_selected,
+        ) = torch.ops.torchtitan_deepseek_v4_sparse_attention.forward.default(
+            q,
+            kv,
+            sink,
+            kv_comp,
+            indices,
+            ratio,
+            window,
+            scale,
+        )
         ctx.save_for_backward(
             q,
             kv,
@@ -1048,23 +1090,29 @@ class SparseAttention(torch.autograd.Function):
             csa_max_selected,
             csa_min_selected,
         )
-        ctx.args = ratio, window, scale, mode
+        ctx.args = ratio, window, scale
         return output
 
     @staticmethod
-    def backward(ctx, do):
-        (
-            q,
-            kv,
-            kv_comp,
-            sink,
-            output,
-            lse,
-            csa_bitmap,
-            csa_max_selected,
-            csa_min_selected,
-        ) = ctx.saved_tensors
-        ratio, window, scale, mode = ctx.args
+    @torch.library.triton_op(
+        "torchtitan_deepseek_v4_sparse_attention::backward", mutates_args=()
+    )
+    def _backward_op(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        kv_comp: torch.Tensor,
+        sink: torch.Tensor,
+        output: torch.Tensor,
+        lse: torch.Tensor,
+        csa_bitmap: torch.Tensor,
+        csa_max_selected: torch.Tensor,
+        csa_min_selected: torch.Tensor,
+        do: torch.Tensor,
+        ratio: int,
+        window: int,
+        scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        mode = 0 if ratio == 1 or kv_comp.shape[1] == 0 else 1 if ratio == 4 else 2
         b, length, n, d = q.shape
         dq = torch.empty_like(q)
         dkv = torch.empty_like(kv)
@@ -1089,7 +1137,9 @@ class SparseAttention(torch.autograd.Function):
         sink_partials = torch.empty(
             (n, num_sink_partials), dtype=torch.float32, device=q.device
         )
-        _blocked_backward_kernel[(num_query_blocks, b, triton.cdiv(n, block_heads))](
+        torch.library.wrap_triton(_blocked_backward_kernel)[
+            (num_query_blocks, b, triton.cdiv(n, block_heads))
+        ](
             q,
             kv,
             kv_comp,
@@ -1131,7 +1181,7 @@ class SparseAttention(torch.autograd.Function):
             num_warps=8,
             num_stages=1,
         )
-        _reduce_sink_partials_kernel[(n,)](
+        torch.library.wrap_triton(_reduce_sink_partials_kernel)[(n,)](
             sink_partials,
             dsink,
             num_partials=num_sink_partials,
@@ -1159,7 +1209,7 @@ class SparseAttention(torch.autograd.Function):
             b,
             num_head_blocks,
         )
-        _key_major_backward_kernel[key_grid](
+        torch.library.wrap_triton(_key_major_backward_kernel)[key_grid](
             q,
             kv,
             kv_comp,
@@ -1203,7 +1253,7 @@ class SparseAttention(torch.autograd.Function):
         )
         reduction_block_size = 256
         if store_normal_partials:
-            _reduce_gradient_partials_kernel[
+            torch.library.wrap_triton(_reduce_gradient_partials_kernel)[
                 (triton.cdiv(kv.numel(), reduction_block_size),)
             ](
                 dkv_accumulator,
@@ -1236,7 +1286,7 @@ class SparseAttention(torch.autograd.Function):
                 b,
                 num_head_blocks,
             )
-            _key_major_backward_kernel[compressed_grid](
+            torch.library.wrap_triton(_key_major_backward_kernel)[compressed_grid](
                 q,
                 kv,
                 kv_comp,
@@ -1278,7 +1328,7 @@ class SparseAttention(torch.autograd.Function):
                 num_warps=8,
                 num_stages=1,
             )
-            _reduce_gradient_partials_kernel[
+            torch.library.wrap_triton(_reduce_gradient_partials_kernel)[
                 (triton.cdiv(kv_comp.numel(), reduction_block_size),)
             ](
                 dcomp_partials,
@@ -1288,16 +1338,40 @@ class SparseAttention(torch.autograd.Function):
                 block_size=reduction_block_size,
                 num_warps=4,
             )
-        return (
-            dq,
-            dkv,
-            dsink,
-            dcomp,
-            None,
-            None,
-            None,
-            None,
+        return dq, dkv, dsink, dcomp
+
+    @staticmethod
+    def backward(ctx, do):
+        (
+            q,
+            kv,
+            kv_comp,
+            sink,
+            output,
+            lse,
+            csa_bitmap,
+            csa_max_selected,
+            csa_min_selected,
+        ) = ctx.saved_tensors
+        ratio, window, scale = ctx.args
+        dq, dkv, dsink, dcomp = (
+            torch.ops.torchtitan_deepseek_v4_sparse_attention.backward.default(
+                q,
+                kv,
+                kv_comp,
+                sink,
+                output,
+                lse,
+                csa_bitmap,
+                csa_max_selected,
+                csa_min_selected,
+                do,
+                ratio,
+                window,
+                scale,
+            )
         )
+        return dq, dkv, dsink, dcomp, None, None, None, None
 
 
 def _validate_inputs(

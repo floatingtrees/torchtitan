@@ -1,0 +1,175 @@
+DeepSeek-V4 sparse-attention 100-step benchmark
+================================================
+
+Branches
+--------
+
+test/flex_attention
+  PyTorch FlexAttention with sparse masks and the post-LSE sink correction.
+
+test/gather_attention
+  Gather-based sparse attention. Index construction remains eager; gather,
+  QK, masking, FP32 softmax, and PV are compiled together with torch.compile.
+
+test/custom_kernel
+  The optimized Triton sparse-attention forward and backward kernel.
+
+The branches use the same DeepSeek-V4 debug model and differ only in the
+attention backend plus this reproduction file. The debug model contains four
+layers with compression ratios (4, 1, 1, 4), so this benchmark covers CSA and
+SWA. It does not cover HCA.
+
+Measured configuration
+----------------------
+
+Date: 2026-07-02
+GPU: one NVIDIA GB200, 184.30 GiB
+PyTorch: 2.14.0a0+gita020fd1
+Dataset: local tests/assets/c4_test C4 subset, configured to re-loop
+Model: deepseek_v4_debugmodel
+Training dtype: bfloat16
+Local batch size: 8
+Sequence length: 2048
+Steps: 100
+Seed: 42
+Trainer-wide torch.compile: disabled
+Metrics frequency: every step
+
+The timed runs intentionally do not use --debug.deterministic. That option
+disables FlexAttention max-autotuning and coordinate descent but does not make
+an equivalent change to the other backends, so it biases the timing comparison.
+The same seed, examples, model configuration, optimizer, and schedule are used
+for all branches. Numerical validation is based on the complete 100-step C4
+loss and gradient-norm trajectories.
+
+Install
+-------
+
+From the repository root:
+
+  pip install -r requirements.txt
+
+Run
+---
+
+Check out one branch and set BACKEND to flex, gather, or custom. Use a new
+RUN_DIR and a fresh cache directory for every cold-start measurement.
+
+  BACKEND=flex
+  RUN_DIR="$PWD/outputs/${BACKEND}_attention_100_steps"
+  CACHE_ROOT="$(mktemp -d /tmp/${BACKEND}_attention_cache.XXXXXX)"
+  mkdir -p "$RUN_DIR"
+
+  CUDA_VISIBLE_DEVICES=0 \
+  NGPU=1 \
+  LOG_RANK=0 \
+  MODULE=deepseek_v4 \
+  CONFIG=deepseek_v4_debugmodel \
+  TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/inductor" \
+  TRITON_CACHE_DIR="$CACHE_ROOT/triton" \
+  /usr/bin/time -f "wall_seconds=%e" -o "$RUN_DIR/wall_time.txt" \
+  ./run_train.sh \
+    --training.steps 100 \
+    --training.dtype bfloat16 \
+    --debug.seed 42 \
+    --metrics.enable-tensorboard \
+    --metrics.log-freq 1 \
+    --metrics.save-tb-folder tb \
+    --dump-folder "$RUN_DIR" \
+    > "$RUN_DIR/train.log" 2>&1
+
+The wall time includes process and model initialization, cold compilation,
+all 100 steps, and TorchTitan's final two-second synchronization sleep.
+The structured-log step_end sum is the time spent inside the 100 training
+steps. Step 1 includes cold backend compilation/autotuning. Steps 11-100 are
+used for steady-state timing.
+
+Analyze
+-------
+
+Set RUN_DIR to the directory from the run command and execute:
+
+RUN_DIR="$RUN_DIR" python - <<'PY'
+import glob
+import json
+import math
+import os
+import statistics
+
+from tensorboard.backend.event_processing.event_accumulator import (
+    EventAccumulator,
+)
+
+run_dir = os.environ["RUN_DIR"]
+event_paths = glob.glob(
+    os.path.join(run_dir, "tb", "*", "events.out.tfevents.*")
+)
+structured_paths = glob.glob(
+    os.path.join(run_dir, "structured_logs", "*.jsonl")
+)
+assert len(event_paths) == 1, event_paths
+assert len(structured_paths) == 1, structured_paths
+
+events = EventAccumulator(event_paths[0])
+events.Reload()
+losses = [
+    event.value
+    for event in events.Scalars("loss_metrics/global_avg_loss")
+]
+grad_norms = [
+    event.value for event in events.Scalars("grad_norm")
+]
+peak_reserved = max(
+    event.value
+    for event in events.Scalars("memory/max_reserved(GiB)")
+)
+
+step_ms = []
+with open(structured_paths[0]) as handle:
+    for line in handle:
+        event = json.loads(line)
+        if event.get("log_type_name") == "step_end":
+            step_ms.append(float(event["value"]))
+
+assert len(losses) == len(grad_norms) == len(step_ms) == 100
+steady_seconds = [value / 1000 for value in step_ms[10:]]
+
+print(open(os.path.join(run_dir, "wall_time.txt")).read().strip())
+print("step_sum_seconds", sum(step_ms) / 1000)
+print("step1_seconds", step_ms[0] / 1000)
+print("steps11_100_mean_seconds", statistics.fmean(steady_seconds))
+print("steps11_100_median_seconds", statistics.median(steady_seconds))
+print("loss_first", losses[0])
+print("loss_final", losses[-1])
+print("loss_first10_mean", statistics.fmean(losses[:10]))
+print("loss_last10_mean", statistics.fmean(losses[-10:]))
+print("loss_all_finite", all(math.isfinite(x) for x in losses))
+print("grad_norm_max", max(grad_norms))
+print("grad_norm_all_finite", all(math.isfinite(x) for x in grad_norms))
+print("peak_reserved_gib", peak_reserved)
+PY
+
+Measured results
+----------------
+
+Backend           FlexAttention   compiled gather   custom Triton
+Process wall (s)       97.60            38.81            38.27
+100 step sum (s)       84.288           25.734           25.889
+Cold step 1 (s)        69.542           10.134            9.902
+Steps 11-100 mean (s)   0.14935           0.15732           0.16039
+Steps 11-100 median (s) 0.15163           0.15841           0.15957
+Peak reserved (GiB)     5.119             4.744             4.371
+
+Loss and gradient validation
+----------------------------
+
+Backend           FlexAttention   compiled gather   custom Triton
+First loss          8.202996         8.203084          8.202959
+Final loss          2.618261         2.612807          2.618631
+First-10 mean       4.837100         4.837058          4.837118
+Last-10 mean        2.677270         2.670938          2.676968
+Maximum grad norm   3.984375         3.984375          3.984375
+
+All 100 losses and gradient norms were finite for every backend. Every
+last-10 mean loss is below its first-10 mean loss, and no run reported an OOM
+or allocator retry.

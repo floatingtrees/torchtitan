@@ -15,14 +15,11 @@ from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
 from .compressor import Compressor, Indexer
+from .triton_sparse_attn import sparse_attention
 
 
 class DSAFlexAttention(Module):
-    """Gather-based sparse attention for DeepSeek V4.
-
-    Replaces FlexAttention with explicit gather/scatter ops and standard
-    softmax over the sparse window + compressed tokens.
-    """
+    """Fused Triton sparse attention for DeepSeek V4."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -45,39 +42,15 @@ class DSAFlexAttention(Module):
         kv_compress,
         compress_topk_idxs,
     ):
-        from .triton_sparse_attn import triton_sparse_attention
-
-        bsz, seqlen, n_heads, head_dim = query_states.size()
-
-        # Build window indices: each query attends to its preceding window_size tokens
-        base = torch.arange(seqlen, device=query_states.device).unsqueeze(1)
-        window_offsets = torch.arange(
-            min(seqlen, self.window_size), device=query_states.device
-        )
-        window_topk = (base - self.window_size + 1).clamp(0) + window_offsets
-        window_topk = torch.where(window_topk > base, -1, window_topk)
-        topk_idxs = window_topk.unsqueeze(0).expand(bsz, -1, -1)
-
-        if self.compress_ratio > 1 and compress_topk_idxs.size(-1) > 0:
-            topk_idxs = torch.cat(
-                [topk_idxs, compress_topk_idxs.to(topk_idxs.device)], dim=-1
-            )
-
-        if self.compress_ratio > 1 and kv_compress.size(1) > 0:
-            kv_states = torch.cat([kv_states, kv_compress], dim=1)
-
-        kv_len = kv_states.size(1)
-        kv_padded = F.pad(kv_states, (0, 0, 0, 1))
-
-        topk_idxs = topk_idxs.where(
-            topk_idxs >= 0, torch.tensor(kv_len, device=topk_idxs.device)
-        )
-        W = topk_idxs.shape[-1]
-
-        # Use fused Triton kernel
-        return triton_sparse_attention(
-            query_states, kv_padded, topk_idxs, attn_sink,
-            self.softmax_scale, kv_len, W
+        return sparse_attention(
+            query_states,
+            kv_states,
+            attn_sink,
+            kv_compress,
+            compress_topk_idxs,
+            self.compress_ratio,
+            window_size=self.window_size,
+            scale=self.softmax_scale,
         )
 
 

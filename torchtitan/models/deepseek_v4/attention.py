@@ -17,6 +17,64 @@ from torchtitan.protocols.module import Module
 from .compressor import Compressor, Indexer
 
 
+# Tensor dimension legend:
+#   B: batch, L: sequence, N: query heads, D: head dimension
+#   K: padded key/value length, W: sparse key count, X: flattened L * W
+def _gather_sparse_attention_core(
+    query_BLND: torch.Tensor,
+    kv_padded_BKD: torch.Tensor,
+    topk_indices_BLW: torch.Tensor,
+    invalid_mask_BLW: torch.Tensor,
+    attn_sink_N: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Apply gather-based sparse attention to precomputed sparse indices."""
+    batch_size, sequence_length, num_heads, head_dim = query_BLND.shape
+    num_sparse_keys = topk_indices_BLW.shape[-1]
+
+    indices_BXD = (
+        topk_indices_BLW.reshape(batch_size, -1)
+        .unsqueeze(-1)
+        .expand(-1, -1, head_dim)
+    )
+    kv_gathered_BLWD = torch.gather(kv_padded_BKD, 1, indices_BXD).reshape(
+        batch_size,
+        sequence_length,
+        num_sparse_keys,
+        head_dim,
+    )
+
+    query_BNLD = query_BLND.transpose(1, 2)
+    scores_BNLW = (
+        torch.einsum("bnld,blwd->bnlw", query_BNLD, kv_gathered_BLWD)
+        * softmax_scale
+    )
+    scores_BNLW = scores_BNLW.masked_fill(
+        invalid_mask_BLW.unsqueeze(1),
+        torch.finfo(scores_BNLW.dtype).min,
+    )
+
+    sink_BNL1 = attn_sink_N.reshape(1, -1, 1, 1).expand(
+        batch_size,
+        num_heads,
+        sequence_length,
+        1,
+    )
+    scores_with_sink_BNLW = torch.cat([scores_BNLW, sink_BNL1], dim=-1)
+    probabilities_BNLW = F.softmax(
+        scores_with_sink_BNLW.float(), dim=-1
+    ).to(scores_with_sink_BNLW.dtype)[..., :-1]
+    output_BNLD = torch.einsum(
+        "bnlw,blwd->bnld", probabilities_BNLW, kv_gathered_BLWD
+    )
+    return output_BNLD.transpose(1, 2).contiguous()
+
+
+_compiled_gather_sparse_attention_core = torch.compile(
+    _gather_sparse_attention_core
+)
+
+
 class DSAFlexAttention(Module):
     """Gather-based sparse attention for DeepSeek V4.
 
@@ -45,7 +103,7 @@ class DSAFlexAttention(Module):
         kv_compress,
         compress_topk_idxs,
     ):
-        bsz, seqlen, n_heads, head_dim = query_states.size()
+        bsz, seqlen, _, _ = query_states.size()
 
         # Build window indices: each query attends to its preceding window_size tokens
         # topk_idxs: (seqlen, window_size)
@@ -78,37 +136,16 @@ class DSAFlexAttention(Module):
         topk_idxs = topk_idxs.where(
             topk_idxs >= 0, torch.tensor(kv_len, device=topk_idxs.device)
         )
-        # topk_idxs: (B, S, W)
-        W = topk_idxs.shape[-1]
-
-        # Gather KV at sparse positions: (B, S*W, D) -> (B, S, W, D)
-        idx_flat = topk_idxs.long().reshape(bsz, -1)
-        idx_expanded = idx_flat.unsqueeze(-1).expand(-1, -1, head_dim)
-        kv_gathered = torch.gather(kv_padded, 1, idx_expanded)
-        kv_gathered = kv_gathered.reshape(bsz, seqlen, W, head_dim)
-
-        # Compute attention scores: Q @ K_gathered^T
-        # query_states: (B, S, H, D) -> (B, H, S, D)
-        q = query_states.transpose(1, 2)
-        scores = torch.einsum("bhsd,bswd->bhsw", q, kv_gathered) * self.softmax_scale
-
-        # Mask invalid (pad) positions to -inf
-        invalid_mask = (topk_idxs == kv_len)  # (B, S, W)
-        scores = scores.masked_fill(
-            invalid_mask.unsqueeze(1), torch.finfo(scores.dtype).min
+        topk_idxs = topk_idxs.long()
+        invalid_mask = topk_idxs == kv_len
+        return _compiled_gather_sparse_attention_core(
+            query_states,
+            kv_padded,
+            topk_idxs,
+            invalid_mask,
+            attn_sink,
+            self.softmax_scale,
         )
-
-        # Append sink logit: (B, H, S, 1)
-        sink_logit = attn_sink.reshape(1, -1, 1, 1).expand(bsz, n_heads, seqlen, 1)
-        combined = torch.cat([scores, sink_logit], dim=-1)  # (B, H, S, W+1)
-        probs = F.softmax(combined.float(), dim=-1).to(combined.dtype)
-        attn_probs = probs[..., :-1]  # (B, H, S, W) — drop sink weight (v_sink=0)
-
-        # Weighted sum: (B, H, S, W) @ (B, S, W, D) -> (B, H, S, D)
-        attn_output = torch.einsum("bhsw,bswd->bhsd", attn_probs, kv_gathered)
-        # Back to (B, S, H, D)
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        return attn_output
 
 
 class GetAttnScores(Module):

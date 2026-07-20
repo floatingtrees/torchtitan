@@ -59,7 +59,7 @@ class DSAFlexAttention(FlexAttention):
             kv_len,
             device=device,
             BLOCK_SIZE=self.block_size,
-            separate_full_blocks=False,
+            separate_full_blocks=True,
         )
 
     def _create_indexer_block_causal_mask(
@@ -100,7 +100,7 @@ class DSAFlexAttention(FlexAttention):
             kv_len,
             device=device,
             BLOCK_SIZE=self.block_size,
-            separate_full_blocks=False,
+            separate_full_blocks=True,
         )
 
     def _create_compress_causal_mask(
@@ -135,7 +135,7 @@ class DSAFlexAttention(FlexAttention):
             kv_len,
             device=device,
             BLOCK_SIZE=self.block_size,
-            separate_full_blocks=False,
+            separate_full_blocks=True,
         )
 
     def forward(
@@ -199,8 +199,9 @@ class DSAFlexAttention(FlexAttention):
             # out_BLNH: (bsz, seqlen, n_heads, head_dim)
             # lse_BLN: (bsz, seqlen, n_heads) in float32
             # sink_logit: (n_heads,) in bfloat16
+            # detach LSE so FLASH backward doesn't need dLSE support
             correction = torch.sigmoid(
-                lse_BLN - sink_logit.float()[None, None, :]
+                lse_BLN.detach() - sink_logit.float()[None, None, :]
             )
             return out_BLNH * correction.to(out_BLNH.dtype).unsqueeze(-1)
 

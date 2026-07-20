@@ -471,7 +471,7 @@ def _debugmodel(
     q_lora_rank = 128
     o_lora_rank = 128
     n_groups = 2
-    compress_ratios = (4, 1, 1, 4)
+    compress_ratios = (4, 4, 4, 4)
     window_size = 16
     norm_eps = 1e-6
     index_n_heads = 8

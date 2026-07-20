@@ -466,7 +466,7 @@ def _debugmodel(
     n_layers = 4
     vocab_size = 2048
     n_heads = 16
-    head_dim = 256
+    head_dim = 512
     rope_head_dim = 32
     q_lora_rank = 128
     o_lora_rank = 128

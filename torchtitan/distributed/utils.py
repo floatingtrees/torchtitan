@@ -546,7 +546,15 @@ def set_pg_timeouts(
         for mesh in parallel_dims.get_all_one_dimensional_meshes().values()
     ] + [None]
     for group in groups:
-        torch.distributed.set_timeout(timeout, group)
+        set_timeout = getattr(torch.distributed, "set_timeout", None)
+        if set_timeout is not None:
+            set_timeout(timeout, group)
+        else:
+            # PyTorch 2.13 exposes process-group timeout updates only through
+            # distributed_c10d's private compatibility API.
+            torch.distributed.distributed_c10d._set_pg_timeout(
+                timeout, group
+            )  # pyrefly: ignore[deprecated]
 
 
 @torch.no_grad()

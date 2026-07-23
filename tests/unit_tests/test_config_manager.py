@@ -199,6 +199,47 @@ class TestConfigManager(unittest.TestCase):
         assert config.model_spec.name == "deepseek_v3"
         assert config.model_spec.flavor == "debugmodel"
 
+    def test_deepseek_v4_large_debug_config(self):
+        config_manager = ConfigManager()
+        config = config_manager.parse_args(
+            [
+                "--module",
+                "deepseek_v4",
+                "--config",
+                "deepseek_large_debug_config",
+            ]
+        )
+
+        assert config.model_spec.name == "deepseek_v4"
+        assert config.model_spec.flavor == "large_debug"
+        assert config.training.local_batch_size == 8
+        assert config.training.seq_len == 4096
+        assert config.training.steps == 126
+        assert config.training.dtype == "bfloat16"
+        assert config.compile.enable
+        assert config.compile.components == ["model"]
+        assert config.compile.backend == "inductor"
+        assert not config.profiler.enable_profiling
+        assert config.override.imports == [
+            "torchtitan.models.deepseek_v4.attention_gym_csa"
+        ]
+
+        model = config.model_spec.model
+        assert model.n_layers == 4
+        assert model.compress_ratios == (4, 4, 4, 4)
+        for layer in model.layers:
+            attention = layer.attention
+            assert attention.n_heads == 128
+            assert attention.head_dim == 512
+            assert attention.rope_head_dim == 64
+            assert attention.window_size == 512
+            assert attention.index_n_heads == 64
+            assert attention.index_head_dim == 64
+            assert attention.index_topk == 64
+            assert layer.moe is not None
+            assert layer.moe.router.top_k == 1
+            assert layer.moe.experts.token_dispatcher.top_k == 1
+
     def test_fqn_module_with_config_registry(self):
         """--module torchtitan.models.llama3.config_registry works."""
         config_manager = ConfigManager()

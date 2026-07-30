@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
+
 from torchtitan.config import (
     CompileConfig,
     ParallelismConfig,
@@ -18,8 +20,21 @@ from torchtitan.distributed.full_dtensor import (
     resolve_sparse_fsdp_mesh,
     validate_config,
 )
+from torchtitan.distributed.pipeline_parallel import (
+    _generate_llm_fqn_per_model_part,
+    _get_pipeline_metadata,
+    pipeline_llm,
+)
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
 from torchtitan.models.deepseek_v4.model import DeepSeekV4Model
+
+
+_HC_HEAD_FQNS = (
+    "hc_head",
+    "hc_head_fn",
+    "hc_head_base",
+    "hc_head_scale",
+)
 
 
 def parallelize_deepseek_v4(
@@ -98,3 +113,109 @@ def parallelize_deepseek_v4(
     )
 
     return model
+
+
+def _validate_deepseek_v4_pipeline_modules(
+    model: DeepSeekV4Model,
+    module_fqns_per_model_part: list[list[str]],
+) -> None:
+    if not module_fqns_per_model_part:
+        raise ValueError(
+            "DeepSeek V4 pipeline parallelism requires at least one model part."
+        )
+
+    required_first_stage_fqns = {"tok_embeddings"}
+    required_first_stage_fqns.update(
+        f"layers.{layer_id}"
+        for layer_id, layer in model.layers.items()
+        if layer.moe_enabled and layer.moe.router.hash
+    )
+    invalid_locations = {
+        module_fqn: [
+            stage_idx
+            for stage_idx, stage_fqns in enumerate(module_fqns_per_model_part)
+            if module_fqn in stage_fqns
+        ]
+        for module_fqn in sorted(required_first_stage_fqns)
+    }
+    invalid_locations = {
+        module_fqn: stage_indices
+        for module_fqn, stage_indices in invalid_locations.items()
+        if stage_indices != [0]
+    }
+    if invalid_locations:
+        raise ValueError(
+            "DeepSeek V4 pipeline parallelism requires tok_embeddings and all "
+            "hash-routed layers on stage 0 because raw input IDs are not "
+            f"transported between pipeline stages. Invalid locations: "
+            f"{invalid_locations}."
+        )
+
+    last_stage_idx = len(module_fqns_per_model_part) - 1
+    invalid_hc_head_locations = {
+        fqn: [
+            stage_idx
+            for stage_idx, stage_fqns in enumerate(module_fqns_per_model_part)
+            if fqn in stage_fqns
+        ]
+        for fqn in _HC_HEAD_FQNS
+    }
+    invalid_hc_head_locations = {
+        fqn: stage_indices
+        for fqn, stage_indices in invalid_hc_head_locations.items()
+        if stage_indices not in ([], [last_stage_idx])
+    }
+    if invalid_hc_head_locations:
+        raise ValueError(
+            "DeepSeek V4 pipeline parallelism requires the hc_head module and "
+            "its direct parameters only on the last stage. Invalid locations: "
+            f"{invalid_hc_head_locations}."
+        )
+
+
+def pipeline_deepseek_v4(
+    model: DeepSeekV4Model,
+    *,
+    parallel_dims: ParallelDims,
+    parallelism: ParallelismConfig,
+    model_config: DeepSeekV4Model.Config,
+    **kwargs,
+):
+    """Assign DeepSeek V4-specific modules to pipeline stages."""
+    if parallelism.module_fqns_per_model_part is None:
+        (
+            num_virtual_stages,
+            num_layers,
+            input_weight,
+            output_weight,
+        ) = _get_pipeline_metadata(parallel_dims, parallelism, model_config)
+        module_fqns_per_model_part = _generate_llm_fqn_per_model_part(
+            num_virtual_stages,
+            num_layers,
+            input_weight,
+            output_weight,
+        )
+    else:
+        module_fqns_per_model_part = [
+            list(stage_fqns) for stage_fqns in parallelism.module_fqns_per_model_part
+        ]
+
+    _validate_deepseek_v4_pipeline_modules(
+        model,
+        module_fqns_per_model_part,
+    )
+    for fqn in _HC_HEAD_FQNS:
+        if fqn not in module_fqns_per_model_part[-1]:
+            module_fqns_per_model_part[-1].append(fqn)
+
+    parallelism = dataclasses.replace(
+        parallelism,
+        module_fqns_per_model_part=module_fqns_per_model_part,
+    )
+    return pipeline_llm(
+        model,
+        parallel_dims=parallel_dims,
+        parallelism=parallelism,
+        model_config=model_config,
+        **kwargs,
+    )

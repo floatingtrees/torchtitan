@@ -427,25 +427,31 @@ def _generate_llm_fqn_per_model_part(
 
 def _split_module(
     whole_model: nn.Module,
-    module_names: list[str],
+    fqns_to_keep: list[str],
 ) -> nn.Module:
     """
-    Splits a whole model into a module based on the specified module names.
+    Splits a whole model based on the specified module and parameter FQNs.
 
     Args:
         whole_model: The complete model to be split
-        module_names: List of module names to include in the split
+        fqns_to_keep: Module and direct parameter FQNs to include in the split
 
     Returns:
         The split module
 
     Example usage:
-        module_names = ["tok_embeddings", "layers.0", "layers.1", "norm", "output"]
-        split_module(whole_model, module_names)
+        fqns_to_keep = [
+            "tok_embeddings",
+            "layers.0",
+            "layers.1",
+            "norm",
+            "output",
+            "output_scale",
+        ]
+        split_module(whole_model, fqns_to_keep)
     """
     model = copy.deepcopy(whole_model)
-    # Create a set of modules to keep for faster lookup
-    modules_to_keep = set(module_names)
+    fqns_to_keep_set = set(fqns_to_keep)
     for module_name, module_value in model.named_children():
         # Handle layer-like structures (e.g., "layers.0", "layers.1")
         if isinstance(
@@ -453,7 +459,7 @@ def _split_module(
         ):
             layers_to_keep = {
                 name.split(".", 1)[1]
-                for name in modules_to_keep
+                for name in fqns_to_keep_set
                 if name.startswith(f"{module_name}.")
             }
             if layers_to_keep:
@@ -481,9 +487,18 @@ def _split_module(
                 elif isinstance(module_value, (nn.ModuleList, ModuleList)):
                     setattr(model, module_name, ModuleList())
         # Handle simple module attributes (e.g., "linear", "norm")
-        elif module_name not in modules_to_keep:
+        elif module_name not in fqns_to_keep_set:
             # Replace with None
             setattr(model, module_name, None)
+
+    # Direct parameters belong to the model itself rather than a child module,
+    # so named_children() does not visit them.
+    direct_parameter_names = tuple(
+        name for name, _ in model.named_parameters(recurse=False)
+    )
+    for parameter_name in direct_parameter_names:
+        if parameter_name not in fqns_to_keep_set:
+            setattr(model, parameter_name, None)
     return model
 
 
@@ -544,19 +559,21 @@ def _pipeline_module_split(
     - forward() method should tolerate deleted layers
     - weight initialization methods should tolerate deleted layers
     - Does not support nested moduledict and modulelist structures
+    - Each direct model parameter must be assigned to exactly one stage
 
     Args:
         whole_model: The complete model to be split
         pp_mesh: Pipeline parallel device mesh
         pp_schedule: Name of pipeline parallelism schedule
         device: Device
-        module_names_per_stage: List of lists, where each inner list contains the module names
-                               that should be included in that stage. Module names should be
-                               dot-separated paths. Examples:
+        module_names_per_stage: List of lists, where each inner list contains the module
+                               or direct parameter FQNs that should be included in that
+                               stage. Module names should be dot-separated paths. Examples:
                                - "tok_embeddings" for token embeddings
                                - "layers.0", "layers.1" for specific transformer layers
                                - "norm" for the final normalization layer
                                - "lm_head" for the output projection layer
+                               - "output_scale" for a direct model parameter
 
     Returns:
         Tuple of (stages, models) where stages are PipelineStage objects and models are the
@@ -574,6 +591,26 @@ def _pipeline_module_split(
     num_stages = len(module_names_per_stage)
     stages = []
     models = []
+    direct_parameter_locations = {
+        parameter_name: [
+            stage_idx
+            for stage_idx, stage_fqns in enumerate(module_names_per_stage)
+            if parameter_name in stage_fqns
+        ]
+        for parameter_name, _ in whole_model.named_parameters(recurse=False)
+    }
+    invalid_parameter_locations = {
+        parameter_name: stage_indices
+        for parameter_name, stage_indices in direct_parameter_locations.items()
+        if len(stage_indices) != 1
+    }
+    if invalid_parameter_locations:
+        raise ValueError(
+            "Pipeline parallelism requires each direct model parameter to be "
+            "assigned to exactly one stage. Invalid locations: "
+            f"{invalid_parameter_locations}."
+        )
+
     pp_rank_to_stage_indices = _get_pp_rank_to_stage_indices_mapping(
         pp_rank, pp_degree, pp_schedule, num_stages
     )

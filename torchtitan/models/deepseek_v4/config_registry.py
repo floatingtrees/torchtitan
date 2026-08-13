@@ -145,3 +145,45 @@ def deepseek_large_debug_config() -> Trainer.Config:
     )
     config.override.imports.append("torchtitan.models.deepseek_v4.attention_gym_csa")
     return config
+
+
+def deepseek_v4_flash_config() -> Trainer.Config:
+    config = deepseek_v4_debugmodel()
+    config.model_spec = model_registry("flash")
+    config.model_spec.flavor = "flash"
+    config.training = replace(
+        config.training,
+        local_batch_size=1,
+        seq_len=4096,
+        steps=100,
+        dtype="bfloat16",
+    )
+    config.compile = replace(
+        config.compile,
+        enable=True,
+        components=["model"],
+        backend="inductor",
+    )
+    config.override.imports.append("torchtitan.models.deepseek_v4.attention_gym_csa")
+    return config
+
+
+def deepseek_v4_pro_config() -> Trainer.Config:
+    config = deepseek_v4_debugmodel()
+    config.model_spec = model_registry("pro")
+    config.model_spec.flavor = "pro"
+    config.training = replace(
+        config.training,
+        local_batch_size=1,
+        seq_len=4096,
+        steps=100,
+        dtype="bfloat16",
+    )
+    config.compile = replace(
+        config.compile,
+        enable=True,
+        components=["model"],
+        backend="inductor",
+    )
+    config.override.imports.append("torchtitan.models.deepseek_v4.attention_gym_csa")
+    return config

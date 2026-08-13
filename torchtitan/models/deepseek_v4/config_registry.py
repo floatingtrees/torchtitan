@@ -71,8 +71,8 @@ def deepseek_large_debug_config() -> Trainer.Config:
     config = deepseek_v4_debugmodel()
     assert config.model_spec is not None
 
-    num_layers = 4
-    compression_ratios = (1, 4, 128, 4)
+    num_layers = 8
+    compression_ratios = (1, 4, 128, 4, 1, 4, 128, 4)
     rope = ComplexRoPE.Config(
         dim=64,
         max_seq_len=4096 * 4,

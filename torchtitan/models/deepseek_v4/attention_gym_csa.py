@@ -9,18 +9,26 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Attention Gym compressed sparse attention override for DeepSeek V4.
+"""Attention Gym CuTe DSL overrides for all DeepSeek V4 attention layers.
 
 Install the validated ``floatingtrees/attention-gym`` revision, then activate
 this module with::
 
-    pip install "attn_gym[sparse] @ git+https://github.com/floatingtrees/attention-gym.git@336ea6ce6aa53c8300b8136d3a4de4cf9d09b9b1"
+    pip install "attn_gym[sparse] @ git+https://github.com/floatingtrees/attention-gym.git@dev/dsv4-ref"
 
     --override.imports torchtitan.models.deepseek_v4.attention_gym_csa
 
+All three DeepSeek V4 attention patterns are routed to SM100 CuTe DSL kernels:
+
+- Ratio-1 layers use the sliding window attention (SWA) kernel.
+- Ratio-4 layers use the compressed sparse attention (CSA) kernel.
+- Ratio-128 layers use the heavily compressed attention (HCA) kernel.
+
+Each kernel handles RoPE internally, bypassing torch.compile for the
+attention + RoPE path entirely.
+
 The Attention Gym CuTe backend targets SM100 and requires an attention head
-dimension of 512. Only DeepSeek V4 layers with compression ratio 4 use the CSA
-kernel. Other layers retain the stock attention implementation.
+dimension of 512.
 
 The kernel does not apply the indexer's Hadamard rotation or FP4 quantization.
 This override intentionally omits both until the kernel supports them.
@@ -51,10 +59,18 @@ try:
     from attn_gym.sparse.compressed_sparse_attention.cute import (
         compressed_sparse_attention as _compressed_sparse_attention_cute,
     )
+    from attn_gym.sparse.heavily_compressed_attention.cute import (
+        heavily_compressed_attention as _heavily_compressed_attention_cute,
+    )
+    from attn_gym.sparse.sliding_window_attention.cute import (
+        sliding_window_attention as _sliding_window_attention_cute,
+    )
 
     _ATTENTION_GYM_IMPORT_ERROR: ImportError | None = None
 except ImportError as error:
     _compressed_sparse_attention_cute = None
+    _heavily_compressed_attention_cute = None
+    _sliding_window_attention_cute = None
     _ATTENTION_GYM_IMPORT_ERROR = error
 
 
@@ -138,6 +154,70 @@ def _csa_sharding_config() -> ShardingConfig:
     )
 
 
+def _swa_sharding_config() -> ShardingConfig:
+    q_BHLD = _activation_layout(sequence_axis=2, tp=spmd.S(1))
+    shared_B1LD = _activation_layout(sequence_axis=2, tp=spmd.R)
+    shared_grad_B1LD = _activation_layout(sequence_axis=2, tp=spmd.P)
+    replicated_param = dense_param_placement(tp=spmd.R)
+    partial_param = dense_param_placement(tp=spmd.P)
+    sink_H = dense_param_placement(tp=spmd.S(0))
+
+    input_shardings = {
+        "q_BHLD": q_BHLD,
+        "kv_B1LD": shared_B1LD,
+        "kv_norm_weight_D": replicated_param,
+        "attention_sink_H": sink_H,
+    }
+    grad_placements = (
+        q_BHLD,
+        shared_grad_B1LD,
+        partial_param,
+        sink_H,
+    )
+    return ShardingConfig(
+        in_src_shardings=input_shardings,
+        in_dst_shardings=dict(input_shardings),
+        out_src_shardings=q_BHLD,
+        local_map=LocalMapConfig(in_grad_placements=grad_placements),
+    )
+
+
+def _hca_sharding_config() -> ShardingConfig:
+    q_BHLD = _activation_layout(sequence_axis=2, tp=spmd.S(1))
+    shared_B1LD = _activation_layout(sequence_axis=2, tp=spmd.R)
+    shared_grad_B1LD = _activation_layout(sequence_axis=2, tp=spmd.P)
+    replicated_param = dense_param_placement(tp=spmd.R)
+    partial_param = dense_param_placement(tp=spmd.P)
+    sink_H = dense_param_placement(tp=spmd.S(0))
+
+    input_shardings = {
+        "q_BHLD": q_BHLD,
+        "kv_B1LD": shared_B1LD,
+        "c_B1LD": shared_B1LD,
+        "z_B1LD": shared_B1LD,
+        "b_RD": replicated_param,
+        "kv_norm_weight_D": replicated_param,
+        "compressed_kv_norm_weight_D": replicated_param,
+        "attention_sink_H": sink_H,
+    }
+    grad_placements = (
+        q_BHLD,
+        shared_grad_B1LD,
+        shared_grad_B1LD,
+        shared_grad_B1LD,
+        partial_param,
+        partial_param,
+        partial_param,
+        sink_H,
+    )
+    return ShardingConfig(
+        in_src_shardings=input_shardings,
+        in_dst_shardings=dict(input_shardings),
+        out_src_shardings=q_BHLD,
+        local_map=LocalMapConfig(in_grad_placements=grad_placements),
+    )
+
+
 def _rename_attention_input_sharding(
     sharding_config: ShardingConfig | None,
 ) -> ShardingConfig | None:
@@ -155,6 +235,48 @@ def _rename_attention_input_sharding(
         shardings["x_BLM"] = shardings.pop("x")
         remapped[field_name] = shardings
     return replace(sharding_config, **remapped)
+
+
+# ---------------------------------------------------------------------------
+# SWA kernel wrapper (ratio-1 layers)
+# ---------------------------------------------------------------------------
+
+
+class AttentionGymSWAKernel(Module):
+    """Local-tensor boundary around Attention Gym's SM100 CuTe SWA kernel."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        sliding_window_size: int
+        rope_dims: int
+
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.sliding_window_size = config.sliding_window_size
+        self.rope_dims = config.rope_dims
+
+    def forward(
+        self,
+        q_BHLD: torch.Tensor,
+        kv_B1LD: torch.Tensor,
+        kv_norm_weight_D: torch.Tensor,
+        attention_sink_H: torch.Tensor,
+    ) -> torch.Tensor:
+        assert _sliding_window_attention_cute is not None
+        return _sliding_window_attention_cute(
+            q_BHLD,
+            kv_B1LD,
+            kv_norm_weight_D,
+            attention_sink_H,
+            self.sliding_window_size,
+            self.rope_dims,
+            True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# CSA kernel wrapper (ratio-4 layers)
+# ---------------------------------------------------------------------------
 
 
 class AttentionGymCSAKernel(Module):
@@ -227,16 +349,76 @@ class AttentionGymCSAKernel(Module):
         )
 
 
+# ---------------------------------------------------------------------------
+# HCA kernel wrapper (ratio-128 layers)
+# ---------------------------------------------------------------------------
+
+
+class AttentionGymHCAKernel(Module):
+    """Local-tensor boundary around Attention Gym's SM100 CuTe HCA kernel."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        compression_ratio: int
+        sliding_window_size: int
+        rope_dims: int
+
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.compression_ratio = config.compression_ratio
+        self.sliding_window_size = config.sliding_window_size
+        self.rope_dims = config.rope_dims
+
+    def forward(
+        self,
+        q_BHLD: torch.Tensor,
+        kv_B1LD: torch.Tensor,
+        c_B1LD: torch.Tensor,
+        z_B1LD: torch.Tensor,
+        b_RD: torch.Tensor,
+        kv_norm_weight_D: torch.Tensor,
+        compressed_kv_norm_weight_D: torch.Tensor,
+        attention_sink_H: torch.Tensor,
+    ) -> torch.Tensor:
+        assert _heavily_compressed_attention_cute is not None
+        return _heavily_compressed_attention_cute(
+            q_BHLD,
+            kv_B1LD,
+            c_B1LD,
+            z_B1LD,
+            b_RD,
+            kv_norm_weight_D,
+            compressed_kv_norm_weight_D,
+            attention_sink_H,
+            self.compression_ratio,
+            self.sliding_window_size,
+            self.rope_dims,
+            True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Unified attention module
+# ---------------------------------------------------------------------------
+
+
 class AttentionGymCSAAttention(Attention):
-    """DeepSeek V4 attention using Attention Gym CSA on ratio-4 layers."""
+    """DeepSeek V4 attention using Attention Gym CuTe DSL for all layers."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Attention.Config):
-        csa_kernel: AttentionGymCSAKernel.Config
+        swa_kernel: AttentionGymSWAKernel.Config | None = None
+        csa_kernel: AttentionGymCSAKernel.Config | None = None
+        hca_kernel: AttentionGymHCAKernel.Config | None = None
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
-        self.csa_kernel = config.csa_kernel.build()
+        if config.swa_kernel is not None:
+            self.swa_kernel = config.swa_kernel.build()
+        if config.csa_kernel is not None:
+            self.csa_kernel = config.csa_kernel.build()
+        if config.hca_kernel is not None:
+            self.hca_kernel = config.hca_kernel.build()
 
     def _query_inputs(
         self,
@@ -285,10 +467,21 @@ class AttentionGymCSAAttention(Attention):
         b_b_RD = bias_RCD[:, 0, :].contiguous()
         return c_a_B1LD, c_b_B1LD, z_a_B1LD, z_b_B1LD, b_a_RD, b_b_RD
 
-    def forward(self, x_BLM, attention_masks=None, positions=None):
-        if self.compress_ratio != 4:
-            return super().forward(x_BLM, attention_masks, positions)
+    def _forward_swa(self, x_BLM: torch.Tensor) -> torch.Tensor:
+        """Ratio-1: sliding window attention via CuTe DSL."""
+        _, q_BHLD = self._query_inputs(x_BLM)
+        kv_B1LD = self.wkv(x_BLM).unsqueeze(1)
+        attention_sink_H = self.attn_sink.weight.squeeze(-1)
+        out_BHLD = self.swa_kernel(
+            q_BHLD,
+            kv_B1LD,
+            self.kv_norm.weight,
+            attention_sink_H,
+        )
+        return self._project_output(out_BHLD)
 
+    def _forward_csa(self, x_BLM: torch.Tensor) -> torch.Tensor:
+        """Ratio-4: compressed sparse attention via CuTe DSL."""
         qr_BLA, q_BHLD = self._query_inputs(x_BLM)
 
         q_index_BLIJ = self.indexer.wq_b(qr_BLA).unflatten(
@@ -345,12 +538,44 @@ class AttentionGymCSAAttention(Attention):
         )
         return self._project_output(out_BHLD)
 
+    def _forward_hca(self, x_BLM: torch.Tensor) -> torch.Tensor:
+        """Ratio-128: heavily compressed attention via CuTe DSL."""
+        _, q_BHLD = self._query_inputs(x_BLM)
+        kv_B1LD = self.wkv(x_BLM).unsqueeze(1)
+
+        compressor = self.compressor_128
+        c_B1LD = compressor.wkv(x_BLM).unsqueeze(1).contiguous()
+        z_B1LD = compressor.wgate(x_BLM).unsqueeze(1).contiguous()
+        b_RD = compressor.ape.weight.contiguous()
+
+        attention_sink_H = self.attn_sink.weight.squeeze(-1)
+        out_BHLD = self.hca_kernel(
+            q_BHLD,
+            kv_B1LD,
+            c_B1LD,
+            z_B1LD,
+            b_RD,
+            self.kv_norm.weight,
+            compressor.norm.weight,
+            attention_sink_H,
+        )
+        return self._project_output(out_BHLD)
+
+    def forward(self, x_BLM, attention_masks=None, positions=None):
+        if self.compress_ratio == 1 and hasattr(self, "swa_kernel"):
+            return self._forward_swa(x_BLM)
+        elif self.compress_ratio == 4 and hasattr(self, "csa_kernel"):
+            return self._forward_csa(x_BLM)
+        elif self.compress_ratio >= 128 and hasattr(self, "hca_kernel"):
+            return self._forward_hca(x_BLM)
+        return super().forward(x_BLM, attention_masks, positions)
+
 
 @override(
     "deepseek_v4_attention_gym_csa",
     target=Attention.Config,
     exact=True,
-    description="Attention Gym SM100 CuTe CSA for DeepSeek V4 ratio-4 layers.",
+    description="Attention Gym SM100 CuTe kernels for all DeepSeek V4 layers.",
 )
 def attention_gym_csa(cfg: Attention.Config) -> AttentionGymCSAAttention.Config:
     if _ATTENTION_GYM_IMPORT_ERROR is not None:
@@ -359,19 +584,45 @@ def attention_gym_csa(cfg: Attention.Config) -> AttentionGymCSAAttention.Config:
             "fork to be installed."
         ) from _ATTENTION_GYM_IMPORT_ERROR
 
-    csa_kernel = AttentionGymCSAKernel.Config(
-        compression_ratio=cfg.compress_ratio,
-        num_topk_blocks=cfg.index_topk,
-        sliding_window_size=cfg.window_size,
-        rope_dims=cfg.rope_head_dim,
-        sharding_config=_csa_sharding_config(),
-    )
+    swa_kernel = None
+    csa_kernel = None
+    hca_kernel = None
+
+    if cfg.compress_ratio == 1:
+        swa_kernel = AttentionGymSWAKernel.Config(
+            sliding_window_size=cfg.window_size,
+            rope_dims=cfg.rope_head_dim,
+            sharding_config=_swa_sharding_config(),
+        )
+    elif cfg.compress_ratio == 4:
+        csa_kernel = AttentionGymCSAKernel.Config(
+            compression_ratio=cfg.compress_ratio,
+            num_topk_blocks=cfg.index_topk,
+            sliding_window_size=cfg.window_size,
+            rope_dims=cfg.rope_head_dim,
+            sharding_config=_csa_sharding_config(),
+        )
+    elif cfg.compress_ratio >= 128:
+        hca_kernel = AttentionGymHCAKernel.Config(
+            compression_ratio=cfg.compress_ratio,
+            sliding_window_size=cfg.window_size,
+            rope_dims=cfg.rope_head_dim,
+            sharding_config=_hca_sharding_config(),
+        )
+
     return derive(
         cfg,
         AttentionGymCSAAttention.Config,
+        swa_kernel=swa_kernel,
         csa_kernel=csa_kernel,
+        hca_kernel=hca_kernel,
         sharding_config=_rename_attention_input_sharding(cfg.sharding_config),
     )
 
 
-__all__ = ["AttentionGymCSAAttention", "AttentionGymCSAKernel"]
+__all__ = [
+    "AttentionGymCSAAttention",
+    "AttentionGymCSAKernel",
+    "AttentionGymHCAKernel",
+    "AttentionGymSWAKernel",
+]

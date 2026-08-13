@@ -31,6 +31,25 @@ def _build_hash_routing_table(vocab_size, num_experts, top_k, device=None, chunk
     return tid2eid
 
 
+@torch.library.custom_op(
+    "deepseek_v4::hash_route", mutates_args=(), device_types="cuda"
+)
+def _hash_route(
+    routing_table: torch.Tensor, input_ids: torch.Tensor
+) -> torch.Tensor:
+    return routing_table[input_ids]
+
+
+@_hash_route.register_fake
+def _hash_route_fake(
+    routing_table: torch.Tensor, input_ids: torch.Tensor
+) -> torch.Tensor:
+    top_k = routing_table.shape[1]
+    return torch.empty(
+        (*input_ids.shape, top_k), dtype=routing_table.dtype, device=input_ids.device
+    )
+
+
 class DeepSeekV4Router(TokenChoiceTopKRouter):
     @dataclass(kw_only=True, slots=True)
     class Config(TokenChoiceTopKRouter.Config):
@@ -52,6 +71,12 @@ class DeepSeekV4Router(TokenChoiceTopKRouter):
                 ),
                 persistent=True,
             )
+        else:
+            self.register_buffer(
+                "tid2eid",
+                torch.empty(0, dtype=torch.long),
+                persistent=False,
+            )
 
     def _init_self_buffers(self, *, buffer_device=None):
         if self.hash:
@@ -67,11 +92,11 @@ class DeepSeekV4Router(TokenChoiceTopKRouter):
         if isinstance(input_ids, DTensor):
             input_ids = input_ids.to_local()
 
-        tid2eid = self.tid2eid
-        if isinstance(tid2eid, DTensor):
-            tid2eid = tid2eid.to_local()
+        routing_table = self.tid2eid
+        if isinstance(routing_table, DTensor):
+            routing_table = routing_table.to_local()
 
-        selected_experts_indices = tid2eid.to(input_ids.device)[input_ids]
+        selected_experts_indices = _hash_route(routing_table, input_ids)
         if isinstance(scores, DTensor):
             selected_experts_indices = DTensor.from_local(
                 selected_experts_indices,

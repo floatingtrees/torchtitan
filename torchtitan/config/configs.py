@@ -154,8 +154,9 @@ class ParallelismConfig:
 
     module_fqns_per_model_part: list[list[str]] | None = None
     """
-    Specify a list of lists containing the FQNs (Fully Qualified Names) of modules for each model chunk.
-    Each inner list represents one model chunk and contains the module names that belong to that chunk.
+    Specify a list of lists containing the FQNs (Fully Qualified Names) of modules and direct model
+    parameters for each model chunk. Each inner list represents one model chunk and contains the FQNs
+    that belong to that chunk. Every direct model parameter must be assigned to exactly one chunk.
     e.g. [['tok_embeddings', 'layers.0'], ['layers.1', 'layers.2'], ['layers.3', 'layers.4']]
     will create 3 chunks: the first containing tok_embeddings and layers.0,
     the second containing layers.1 and layers.2, and the third containing layers.3 and layers.4.

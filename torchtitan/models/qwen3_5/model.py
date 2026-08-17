@@ -288,11 +288,10 @@ class GatedDeltaNet(Module):
             # restores DTensor-ness, with explicit gradient placements.
             x_plc = x.placements
             w = conv.weight
-            w_plc = w.placements  # pyrefly: ignore [missing-attribute]
+            w_plc = w.placements
 
             def _conv(x_local: torch.Tensor, w_local: torch.Tensor) -> torch.Tensor:
                 # groups == local out-channels (depthwise, channel-sharded)
-                # pyrefly: ignore [no-matching-overload]
                 return F.conv1d(
                     x_local,
                     w_local,
@@ -310,7 +309,7 @@ class GatedDeltaNet(Module):
                 in_grad_placements=(x_plc, w_plc),
                 device_mesh=x.device_mesh,
             )
-            x = conv_dt(x, w)  # pyrefly: ignore
+            x = conv_dt(x, w)
         else:
             x = conv(x)
         return F.silu(x).transpose(1, 2)

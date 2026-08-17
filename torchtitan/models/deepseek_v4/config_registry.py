@@ -1,25 +1,32 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import replace
 
+from torchtitan.components.checkpoint import CheckpointManager
+
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.optimizer import default_adamw
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.optimizer import default_adamw
 from torchtitan.config import (
     CompileConfig,
+    DebugConfig,
     ParallelismConfig,
     TrainingConfig,
-    DebugConfig,
 )
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common import ComplexRoPE
-from torchtitan.trainer import Trainer
 from torchtitan.tools.profiler import Profiler
+from torchtitan.trainer import Trainer
 
 from . import _build_v4_layers, model_registry
 
@@ -65,7 +72,7 @@ def deepseek_large_debug_config() -> Trainer.Config:
     assert config.model_spec is not None
 
     num_layers = 4
-    compression_ratios = (4,) * num_layers
+    compression_ratios = (1, 4, 128, 4)
     rope = ComplexRoPE.Config(
         dim=64,
         max_seq_len=4096 * 4,
@@ -106,7 +113,7 @@ def deepseek_large_debug_config() -> Trainer.Config:
         route_norm=False,
         route_scale=1.5,
         load_balance_coeff=1e-3,
-        moe_comm_backend="standard",
+        moe_comm_backend="hybridep",
         non_blocking_capacity_factor=None,
         rope=rope,
         rope_compress=compressed_rope,

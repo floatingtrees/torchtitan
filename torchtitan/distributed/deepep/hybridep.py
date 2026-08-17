@@ -134,7 +134,6 @@ def _dispatch_impl(
     """
     num_local_experts = num_experts // ep_size
 
-    # pyrefly: ignore [bad-argument-type]
     group = dist.distributed_c10d._resolve_process_group(group_name)
     get_buffer(
         group=group,
@@ -215,7 +214,16 @@ def _dispatch_fake(
             pad_multiple=pad_multiple,
         )
     else:
-        out_tokens = x.shape[0]
+        # In blocking mode with EP>1, the output token count is data-dependent
+        # (determined by actual routing decisions at runtime). Use an unbacked
+        # SymInt so torch.compile handles the dynamic shape correctly.
+        ctx = torch.library.get_ctx()
+        out_tokens = ctx.new_dynamic_size()
+        # Upper bound: each of the input tokens can be routed top_k times,
+        # and in the worst case all land on this rank's local experts.
+        top_k = topk_idx.shape[1]
+        torch._check(out_tokens <= x.shape[0] * ep_size * min(num_local_experts, top_k))
+        torch._check(out_tokens >= 0)
     hidden = x.new_empty(out_tokens, x.shape[1])
     scores = x.new_empty(out_tokens, dtype=torch.float32)
     tpe = x.new_empty(num_local_experts, dtype=torch.int64)
@@ -323,12 +331,13 @@ def _combine_bwd_fake(
     """Fake combine_bwd for torch.compile tracing."""
     hidden_dim = grad_hidden.shape[1]
     grad_x = grad_hidden.new_empty(num_tokens, hidden_dim)
-    if grad_scores.numel() > 0:
-        grad_probs_dense = grad_hidden.new_empty(
-            num_tokens, num_experts, dtype=torch.float32
-        )
-    else:
-        grad_probs_dense = grad_hidden.new_empty(0, dtype=torch.float32)
+    # At runtime, grad_probs_dense from combine_with_unpermute is None when
+    # probs=None (i.e. grad_scores is empty), returning shape (0,). When
+    # probs is non-None, it returns (num_tokens, num_experts). Match the
+    # runtime behavior: grad_scores from the dispatch backward is always
+    # empty in the current graph structure (scores are applied outside the
+    # dispatch/combine op pair via a separate multiply in combine_tokens).
+    grad_probs_dense = grad_hidden.new_empty(0, dtype=torch.float32)
     return grad_x, grad_probs_dense
 
 

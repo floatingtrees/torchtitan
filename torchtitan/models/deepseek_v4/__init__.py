@@ -10,7 +10,6 @@ from functools import partial
 import torch.nn as nn
 
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
-from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import (
     ComplexRoPE,
     Embedding,
@@ -34,11 +33,12 @@ from .attention import (
 )
 from .model import DeepSeekV4Model, DeepSeekV4TransformerBlock
 from .moe import DeepSeekV4MoE, DeepSeekV4Router
-from .parallelize import parallelize_deepseek_v4
+from .parallelize import parallelize_deepseek_v4, pipeline_deepseek_v4
 from .state_dict_adapter import DeepSeekV4StateDictAdapter
 
 __all__ = [
     "parallelize_deepseek_v4",
+    "pipeline_deepseek_v4",
     "DeepSeekV4Model",
     "deepseek_v4_configs",
     "model_registry",
@@ -595,7 +595,7 @@ def model_registry(
         flavor=flavor,
         model=config,
         parallelize_fn=parallelize_deepseek_v4,
-        pipelining_fn=pipeline_llm,
+        pipelining_fn=pipeline_deepseek_v4,
         post_optimizer_build_fn=register_moe_load_balancing_hook,
         state_dict_adapter=DeepSeekV4StateDictAdapter,
     )

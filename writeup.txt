@@ -1,0 +1,233 @@
+================================================================================
+Hybrid EP for DeepSeek V4 on 4xGB200 -- Setup and Results
+================================================================================
+
+Date: 2026-08-17
+Hardware: 4x NVIDIA GB200 (compute capability 10.0, 184.30 GiB each)
+Platform: Linux 6.17.0-1026-nvidia-64k (aarch64)
+
+================================================================================
+1. GOAL
+================================================================================
+
+Enable Hybrid EP (Expert Parallel using DeepEP's TMA-optimized all-to-all for
+GB200/NVLink72) for the DeepSeek V4 model in torchtitan, running with EP=2 on
+4 GPUs with the attention-gym CuTeDSL attention backend.
+
+================================================================================
+2. ENVIRONMENT SETUP
+================================================================================
+
+2.1 Install Python dependencies
+--------------------------------
+
+    pip install -r requirements.txt
+
+This installs tyro, spmd_types, datasets, tokenizers, etc.
+
+2.2 Install DeepEP (hybrid-ep branch)
+--------------------------------------
+
+The DeepEP library lives at third_party/DeepEP-hybrid-ep/. It must be compiled
+for the target GPU architecture. On GB200 (sm_100):
+
+    cd /nvdl/torchtitan/third_party/DeepEP-hybrid-ep
+    TORCH_CUDA_ARCH_LIST="10.0" pip install -e .
+
+Note: The default build tries sm_80/86/90/100, but the hybrid-ep code uses
+sm_90+ PTX features (elect, mbarrier_init, etc.), so building for sm_80/86
+fails. Restrict to sm_100 for GB200.
+
+2.3 Install attention-gym (floatingtrees fork with CuTeDSL sparse kernels)
+---------------------------------------------------------------------------
+
+The DeepSeek V4 attention_gym override requires the floatingtrees fork with
+heavily_compressed_attention and sliding_window_attention:
+
+    pip install "attn_gym[sparse] @ git+https://github.com/floatingtrees/attention-gym.git@dev/dsv4-ref" --force-reinstall --no-deps
+
+This provides the CuTe (CuTeDSL) backend for SM100 sparse attention kernels
+including heavily_compressed_attention and sliding_window_attention.
+
+2.4 Set CUDA_HOME
+------------------
+
+DeepEP's JIT compiler needs CUDA_HOME to find nvcc, headers, and libraries:
+
+    export CUDA_HOME=/usr/local/cuda
+
+Without this, the JIT compile command uses "-I/include -L/lib64" (empty prefix)
+and fails.
+
+================================================================================
+3. CODE CHANGES
+================================================================================
+
+Two files were modified:
+
+3.1 torchtitan/models/deepseek_v4/config_registry.py
+-----------------------------------------------------
+
+Changed the moe_comm_backend in deepseek_large_debug_config from "standard"
+(PyTorch all-to-all collectives) to "hybridep" (DeepEP TMA-optimized kernels):
+
+    # Line 116 in _build_v4_layers call:
+    - moe_comm_backend="standard",
+    + moe_comm_backend="hybridep",
+
+This causes make_token_dispatcher_config() to return a
+HybridEPTokenDispatcher.Config instead of AllToAllTokenDispatcher.Config,
+which uses DeepEP's dispatch_with_permute / combine_with_unpermute under
+the hood.
+
+3.2 torchtitan/distributed/deepep/hybridep.py
+----------------------------------------------
+
+Two fixes to the torch.compile fake (meta) kernels for blocking-mode EP>1:
+
+FIX 1: _dispatch_fake -- dynamic output shape
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In blocking mode with EP>1, the output token count from dispatch is
+data-dependent (depends on actual routing decisions at runtime -- how many
+tokens land on each rank's local experts). The original fake used:
+
+    out_tokens = x.shape[0]  # wrong: input count != output count with EP>1
+
+Fixed to use an unbacked SymInt via torch.library.get_ctx().new_dynamic_size():
+
+    ctx = torch.library.get_ctx()
+    out_tokens = ctx.new_dynamic_size()
+    top_k = topk_idx.shape[1]
+    torch._check(out_tokens <= x.shape[0] * ep_size * min(num_local_experts, top_k))
+    torch._check(out_tokens >= 0)
+
+This tells torch.compile that the output dimension is dynamic and bounded,
+enabling proper guard-free compilation.
+
+FIX 2: _combine_bwd_fake -- avoid data-dependent guard on grad_scores
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The original fake had:
+
+    if grad_scores.numel() > 0:
+        grad_probs_dense = ... (num_tokens, num_experts)
+    else:
+        grad_probs_dense = ... (0,)
+
+With the unbacked SymInt from fix 1, grad_scores.numel() becomes symbolic
+and unguardable, causing:
+    GuardOnDataDependentSymNode: Could not guard on data-dependent expression
+
+Additionally, at runtime grad_probs_dense is always None/empty (1D shape (0,))
+because in the current graph structure, routing scores are applied outside the
+dispatch/combine op pair (in combine_tokens via a separate multiply), so score
+gradients don't flow back through combine_bwd.
+
+Fixed to always return the empty 1D tensor:
+
+    grad_probs_dense = grad_hidden.new_empty(0, dtype=torch.float32)
+
+================================================================================
+4. RUN COMMAND
+================================================================================
+
+    export CUDA_HOME=/usr/local/cuda
+    NGPU=4 MODULE=deepseek_v4 CONFIG=deepseek_large_debug_config ./run_train.sh \
+        --override.imports torchtitan.models.deepseek_v4.attention_gym \
+        --training.dtype bfloat16 \
+        --training.steps 10 \
+        --training.local_batch_size 8 \
+        --training.seq_len 4096 \
+        --parallelism.expert_parallel_degree 2
+
+Key parameters:
+  - NGPU=4: 4 GB200 GPUs
+  - MODULE=deepseek_v4: DeepSeek V4 model
+  - CONFIG=deepseek_large_debug_config: Large debug config (256 dim, 128 heads,
+    512 head_dim, 4 experts, top_k=1, 4 layers with compression ratios 1/4/128/4)
+  - --override.imports torchtitan.models.deepseek_v4.attention_gym:
+    Activates the CuTeDSL attention kernels (backend="cute")
+  - --parallelism.expert_parallel_degree 2: EP=2 (2 experts per rank)
+  - torch.compile is enabled by default in this config (inductor backend)
+
+Mesh layout with EP=2, NGPU=4:
+  - pp=1, dp_replicate=1, dp_shard=4, cp=1, tp=1, ep=2
+  - Active mesh dimensions: ['batch', 'loss', 'ep', 'efsdp', 'fsdp']
+  - 4 experts / 2 EP ranks = 2 local experts per rank
+
+================================================================================
+5. RESULTS
+================================================================================
+
+All 10 training steps completed successfully:
+
+    step:  1  loss: 8.0517  grad_norm: 19.25  memory: 64.47GiB(34.98%)  tps:    182  tflops:    2.43  mfu:  0.10%
+    step:  2  loss: 5.9560  grad_norm: 12.44  memory: 64.54GiB(35.02%)  tps: 93,771  tflops: 1250.30  mfu: 50.01%
+    step:  3  loss: 5.0785  grad_norm:  4.31  memory: 64.54GiB(35.02%)  tps: 93,669  tflops: 1248.93  mfu: 49.96%
+    step:  4  loss: 4.7333  grad_norm:  4.19  memory: 64.54GiB(35.02%)  tps: 95,045  tflops: 1267.28  mfu: 50.69%
+    step:  5  loss: 4.4021  grad_norm:  2.73  memory: 64.54GiB(35.02%)  tps: 93,179  tflops: 1242.41  mfu: 49.70%
+    step:  6  loss: 4.1995  grad_norm:  3.36  memory: 64.54GiB(35.02%)  tps: 94,592  tflops: 1261.24  mfu: 50.45%
+    step:  7  loss: 4.0744  grad_norm:  2.67  memory: 64.54GiB(35.02%)  tps: 94,711  tflops: 1262.84  mfu: 50.51%
+    step:  8  loss: 3.9801  grad_norm:  1.85  memory: 64.54GiB(35.02%)  tps: 93,113  tflops: 1241.52  mfu: 49.66%
+    step:  9  loss: 3.8175  grad_norm:  2.03  memory: 64.54GiB(35.02%)  tps: 94,356  tflops: 1258.09  mfu: 50.32%
+    step: 10  loss: 3.8919  grad_norm:  1.91  memory: 64.54GiB(35.02%)  tps: 94,327  tflops: 1257.71  mfu: 50.31%
+
+Summary:
+  - Steady-state TFLOPs: ~1,250 - 1,267 (steps 2-10)
+  - MFU: ~50% (peak FLOPS reference: 2.500e+15)
+  - Memory usage: 64.54 GiB (35% of 184.30 GiB per GPU)
+  - Loss convergence: 8.05 -> 3.89 over 10 steps
+  - Step 1 is slow due to torch.compile warmup + DeepEP JIT kernel compilation
+
+================================================================================
+6. NOTES AND CAVEATS
+================================================================================
+
+- The inductor cache (/tmp/torchinductor_root/) must be cleared if you change
+  the hybridep.py fake kernels, otherwise stale compiled code causes assertion
+  errors at runtime.
+
+- DeepEP's JIT-compiled CUDA kernels are cached at ~/.deepep/hybrid_ep/jit/.
+  Clear this directory if you rebuild DeepEP or change EP configuration.
+
+- The HybridEP buffer auto-initializes on first dispatch:
+    "Initializing HybridEP buffer: hidden_dim=256, max_tokens_per_rank=32768,
+     num_local_experts=2, ep_size=2"
+
+- The deepseek_large_debug_config already includes the attention_gym_csa
+  override in its override.imports list. When you also pass
+  --override.imports torchtitan.models.deepseek_v4.attention_gym on the CLI,
+  this REPLACES the config's override list (the attention_gym override is a
+  superset that handles all compression ratios including the CSA case).
+
+- The model has 75.8M total parameters with this debug config.
+
+- With top_k=1 and 4 experts across EP=2, load balancing is governed by the
+  DeepSeekV4Router (sqrtsoftplus scoring with route_scale=1.5). The first 2
+  layers use hash routing (n_hash_layers=2) which provides near-uniform
+  distribution.
+
+================================================================================
+7. ARCHITECTURE OVERVIEW
+================================================================================
+
+The hybrid EP data path:
+
+    1. Router computes topk_scores and topk_expert_ids (top_k=1)
+    2. HybridEPTokenDispatcher.dispatch() calls:
+       -> torch.ops.hybridep.dispatch (custom op)
+       -> deep_ep.hybrid_ep_buffer.indices_to_map (routing_map, probs)
+       -> _buffer.dispatch_with_permute (TMA all-to-all + fused permute)
+       Returns: permuted_hidden, permuted_scores, tokens_per_expert, handle
+    3. Expert computation on local experts (GroupedExperts forward)
+    4. HybridEPTokenDispatcher.combine() calls:
+       -> Applies deferred scores: hidden * permuted_scores
+       -> torch.ops.hybridep.combine (custom op)
+       -> _buffer.combine_with_unpermute (reverse all-to-all + unpermute)
+       Returns: combined output in original token order
+
+The custom ops (hybridep::dispatch, hybridep::combine) are registered with
+autograd (setup_context + backward) and fake kernels (for torch.compile
+tracing). The backward uses hybridep::dispatch_bwd and hybridep::combine_bwd
+which reuse the same HybridEP buffer infrastructure.

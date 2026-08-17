@@ -94,7 +94,6 @@ def parallelize_qwen3_5(
         if parallelism.enable_async_tensor_parallel and not model_compile_enabled:
             raise RuntimeError("Async TP requires torch.compile")
 
-        # pyrefly: ignore [not-callable]
         model.parallelize(parallel_dims)
 
     if parallel_dims.tp_enabled:
@@ -109,7 +108,6 @@ def parallelize_qwen3_5(
     if model_compile_enabled:
         apply_compile(model, compile_config)
         if model.vision_encoder is not None:
-            # pyrefly: ignore [bad-argument-type]
             apply_compile(model.vision_encoder, compile_config)
 
     dp_mesh_names = (
@@ -119,7 +117,7 @@ def parallelize_qwen3_5(
 
     if model.vision_encoder is not None:
         _apply_fsdp_to_vision_encoder(
-            model.vision_encoder,  # pyrefly: ignore [bad-argument-type]
+            model.vision_encoder,
             dp_mesh,
             param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
             reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
@@ -137,7 +135,7 @@ def parallelize_qwen3_5(
         edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
 
     apply_fsdp_to_decoder(
-        model,  # pyrefly: ignore [bad-argument-type]
+        model,
         dp_mesh,
         param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
         reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],

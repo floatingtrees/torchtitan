@@ -19,6 +19,8 @@ from torchtitan.models.common.nn_modules import Linear, RMSNorm
 from .mhc import HcHead, HcPost, HcPre
 
 
+# Shape suffix legend:
+# B: batch, L: sequence, C: hyperconnection channel, D: model dimension.
 class DeepSeekV4TransformerBlock(TransformerBlock):
     @dataclass(kw_only=True, slots=True)
     class Config(TransformerBlock.Config):
@@ -236,20 +238,34 @@ class DeepSeekV4Model(Decoder):
         positions: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
     ):
-        input_ids = tokens.detach().long()
-        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
-        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        if self.tok_embeddings is not None:
+            input_ids_BL = tokens.detach().long()
+            h_BLD = self.tok_embeddings(tokens)
+            h_BLCD = h_BLD.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        else:
+            h_BLCD = tokens
+            input_ids_BL = (
+                positions
+                if positions is not None
+                else h_BLCD[..., 0, 0].detach().long()
+            )
 
-        for i in range(self.n_main_layers):
-            layer = self.layers[str(i)]
-            h = layer(h, input_ids, attention_masks, positions)
-        
-        h = self.hc_head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
-        h = self.norm(h) if self.norm is not None else h
+        for layer in self.layers.values():
+            h_BLCD = layer(h_BLCD, input_ids_BL, attention_masks, positions)
+
+        if self.hc_head is None:
+            return h_BLCD
+
+        h_BLD = self.hc_head(
+            h_BLCD,
+            self.hc_head_fn,
+            self.hc_head_scale,
+            self.hc_head_base,
+        )
+        h_BLD = self.norm(h_BLD) if self.norm is not None else h_BLD
         if self._skip_lm_head:
-            return h
-        output = self.lm_head(h) if self.lm_head is not None else h
-        return output
+            return h_BLD
+        return self.lm_head(h_BLD) if self.lm_head is not None else h_BLD
 
 
 def _init_trunc_normal(x, std=0.02):

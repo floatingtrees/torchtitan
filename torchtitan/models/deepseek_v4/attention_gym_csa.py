@@ -1,4 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -8,7 +14,7 @@
 Install the validated ``floatingtrees/attention-gym`` revision, then activate
 this module with::
 
-    pip install git+https://github.com/floatingtrees/attention-gym.git@437fe90
+    pip install "attn_gym[sparse] @ git+https://github.com/floatingtrees/attention-gym.git@336ea6ce6aa53c8300b8136d3a4de4cf9d09b9b1"
 
     --override.imports torchtitan.models.deepseek_v4.attention_gym_csa
 
@@ -42,11 +48,13 @@ from .compressor import Compressor
 # R: compression ratio.
 
 try:
-    from attn_gym.sparse import compressed_sparse_attention
+    from attn_gym.sparse.compressed_sparse_attention.cute import (
+        compressed_sparse_attention as _compressed_sparse_attention_cute,
+    )
 
     _ATTENTION_GYM_IMPORT_ERROR: ImportError | None = None
 except ImportError as error:
-    compressed_sparse_attention = None
+    _compressed_sparse_attention_cute = None
     _ATTENTION_GYM_IMPORT_ERROR = error
 
 
@@ -189,8 +197,8 @@ class AttentionGymCSAKernel(Module):
         compressed_kv_norm_weight_D: torch.Tensor,
         attention_sink_H: torch.Tensor,
     ) -> torch.Tensor:
-        assert compressed_sparse_attention is not None
-        return compressed_sparse_attention(
+        assert _compressed_sparse_attention_cute is not None
+        return _compressed_sparse_attention_cute(
             q_BHLD,
             q_index_BILJ,
             kv_B1LD,
@@ -216,7 +224,6 @@ class AttentionGymCSAKernel(Module):
             self.sliding_window_size,
             self.rope_dims,
             True,
-            backend="cute",
         )
 
 
@@ -230,6 +237,26 @@ class AttentionGymCSAAttention(Attention):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self.csa_kernel = config.csa_kernel.build()
+
+    def _query_inputs(
+        self,
+        x_BLM: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        qr_BLA = self.q_norm(self.wq_a(x_BLM))
+        q_BLHD = self.wq_b(qr_BLA).unflatten(-1, (self.n_heads, self.head_dim))
+        q_BLHD = q_BLHD * torch.rsqrt(
+            q_BLHD.square().mean(-1, keepdim=True) + self.norm_eps
+        )
+        return qr_BLA, q_BLHD.transpose(1, 2).contiguous()
+
+    def _project_output(self, out_BHLD: torch.Tensor) -> torch.Tensor:
+        bsz, _, seqlen, _ = out_BHLD.shape
+        out_BLHD = out_BHLD.transpose(1, 2).contiguous()
+        num_local_groups = self.n_groups // (self.n_heads // out_BLHD.shape[2])
+        out_BLGD = out_BLHD.view(bsz, seqlen, num_local_groups, -1)
+        wo_a_GAD = self.wo_a.weight.view(num_local_groups, self.o_lora_rank, -1)
+        out_BLGA = torch.einsum("blgd,gad->blga", out_BLGD, wo_a_GAD)
+        return self.wo_b(out_BLGA.reshape(bsz, seqlen, -1))
 
     @staticmethod
     def _compressor_inputs(
@@ -262,14 +289,7 @@ class AttentionGymCSAAttention(Attention):
         if self.compress_ratio != 4:
             return super().forward(x_BLM, attention_masks, positions)
 
-        bsz, seqlen, _ = x_BLM.shape
-        qr_BLA = self.q_norm(self.wq_a(x_BLM))
-
-        q_BLHD = self.wq_b(qr_BLA).unflatten(-1, (self.n_heads, self.head_dim))
-        q_BLHD = q_BLHD * torch.rsqrt(
-            q_BLHD.square().mean(-1, keepdim=True) + self.norm_eps
-        )
-        q_BHLD = q_BLHD.transpose(1, 2).contiguous()
+        qr_BLA, q_BHLD = self._query_inputs(x_BLM)
 
         q_index_BLIJ = self.indexer.wq_b(qr_BLA).unflatten(
             -1, (self.indexer.num_index_heads, self.indexer.head_dim)
@@ -323,13 +343,7 @@ class AttentionGymCSAAttention(Attention):
             self.compressor.norm.weight,
             attention_sink_H,
         )
-
-        out_BLHD = out_BHLD.transpose(1, 2).contiguous()
-        num_local_groups = self.n_groups // (self.n_heads // out_BLHD.shape[2])
-        out_BLGD = out_BLHD.view(bsz, seqlen, num_local_groups, -1)
-        wo_a_GAD = self.wo_a.weight.view(num_local_groups, self.o_lora_rank, -1)
-        out_BLGA = torch.einsum("blgd,gad->blga", out_BLGD, wo_a_GAD)
-        return self.wo_b(out_BLGA.reshape(bsz, seqlen, -1))
+        return self._project_output(out_BHLD)
 
 
 @override(

@@ -226,7 +226,7 @@ class TestConfigManager(unittest.TestCase):
 
         model = config.model_spec.model
         assert model.n_layers == 4
-        assert model.compress_ratios == (4, 4, 4, 4)
+        assert model.compress_ratios == (1, 4, 128, 4)
         for layer in model.layers:
             attention = layer.attention
             assert attention.n_heads == 128

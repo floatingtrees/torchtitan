@@ -1,0 +1,804 @@
+diff --git a/attn_gym/sparse/compressed_sparse_attention/cute/__init__.py b/attn_gym/sparse/compressed_sparse_attention/cute/__init__.py
+index 88a0fcb..145fa0d 100755
+--- a/attn_gym/sparse/compressed_sparse_attention/cute/__init__.py
++++ b/attn_gym/sparse/compressed_sparse_attention/cute/__init__.py
+@@ -421,7 +421,8 @@ def _compressed_sparse_attention_forward(
+         if device_index is None:
+             device_index = torch.cuda.current_device()
+         cos, sin = _rope_tables(device_index, sequence_length, rope_dims)
+-        empty_kv = torch.empty(batch, 0, 1, _HEAD_DIM, device=Q.device, dtype=Q.dtype)
++        empty_local_kv = torch.empty(batch, 0, 1, _HEAD_DIM, device=Q.device, dtype=Q.dtype)
++        empty_compressed_kv = torch.empty_like(empty_local_kv)
+         gather = torch.empty(batch, sequence_length, 1, device=Q.device, dtype=torch.int32)
+         combined_lse = (
+             attention_sink.view(1, 1, heads)
+@@ -429,7 +430,14 @@ def _compressed_sparse_attention_forward(
+             .float()
+             .contiguous()
+         )
+-        return output, (empty_kv, empty_kv, gather, cos, sin, combined_lse)
++        return output, (
++            empty_local_kv,
++            empty_compressed_kv,
++            gather,
++            cos,
++            sin,
++            combined_lse,
++        )
+
+     dtype = cute_dtype(Q)
+     device_index = Q.device.index
+@@ -1176,17 +1184,31 @@ class _CuteCompressedSparseAttention(torch.autograd.Function):
+         has_attention = has_local or has_compressed
+
+         if has_attention:
+-            recompute_tensors = tuple(tensor.detach() for tensor in ctx.saved_tensors)
+-            output, state = _compressed_sparse_attention_forward(
+-                *recompute_tensors,
+-                ctx.compression_rate,
+-                ctx.num_topk_blocks,
+-                ctx.sliding_window_size,
+-                ctx.rope_dims,
+-                ctx.share_kv,
+-                _return_state=True,
+-            )
+-            local_kv, compressed_kv, gather, cos, sin, combined_lse = state
++            forward_state = getattr(ctx, "forward_state", None)
++            if forward_state is None:
++                recompute_tensors = tuple(tensor.detach() for tensor in ctx.saved_tensors)
++                output, state = _compressed_sparse_attention_forward(
++                    *recompute_tensors,
++                    ctx.compression_rate,
++                    ctx.num_topk_blocks,
++                    ctx.sliding_window_size,
++                    ctx.rope_dims,
++                    ctx.share_kv,
++                    _return_state=True,
++                )
++                local_kv, compressed_kv, gather, _cos, _sin, combined_lse = state
++            else:
++                (
++                    output,
++                    local_kv,
++                    compressed_kv,
++                    gather,
++                    combined_lse,
++                ) = forward_state
++            device_index = Q.device.index
++            if device_index is None:
++                device_index = torch.cuda.current_device()
++            cos, sin = _rope_tables(device_index, sequence, ctx.rope_dims)
+             blocks = compressed_kv.shape[1]
+             local_length = local_kv.shape[1]
+             dQ = torch.empty_like(Q)
+@@ -1459,6 +1481,7 @@ class _RuntimeBackwardContext:
+     def __init__(
+         self,
+         tensors: tuple[torch.Tensor, ...],
++        forward_state: tuple[torch.Tensor, ...],
+         compression_rate: int,
+         num_topk_blocks: int,
+         sliding_window_size: int,
+@@ -1466,6 +1489,7 @@ class _RuntimeBackwardContext:
+         share_kv: bool,
+     ) -> None:
+         self.saved_tensors = tensors
++        self.forward_state = forward_state
+         self.compression_rate = compression_rate
+         self.num_topk_blocks = num_topk_blocks
+         self.sliding_window_size = sliding_window_size
+@@ -1502,6 +1526,11 @@ def _cute_compressed_sparse_attention_backward(
+     compressed_indices_norm_weight: torch.Tensor,
+     compressed_kv_norm_weight: torch.Tensor,
+     attention_sink: torch.Tensor,
++    output: torch.Tensor,
++    local_kv: torch.Tensor,
++    compressed_kv: torch.Tensor,
++    gather: torch.Tensor,
++    combined_lse: torch.Tensor,
+     dout: torch.Tensor,
+     compression_rate: int,
+     num_topk_blocks: int,
+@@ -1545,6 +1574,7 @@ def _cute_compressed_sparse_attention_backward(
+     )
+     runtime_ctx = _RuntimeBackwardContext(
+         tensors,
++        (output, local_kv, compressed_kv, gather, combined_lse),
+         compression_rate,
+         num_topk_blocks,
+         sliding_window_size,
+@@ -1580,6 +1610,11 @@ def _cute_compressed_sparse_attention_backward_fake(
+     compressed_indices_norm_weight,
+     compressed_kv_norm_weight,
+     attention_sink,
++    output,
++    local_kv,
++    compressed_kv,
++    gather,
++    combined_lse,
+     dout,
+     compression_rate,
+     num_topk_blocks,
+@@ -1597,6 +1632,11 @@ def _cute_compressed_sparse_attention_backward_fake(
+         B_Ia,
+         B_Ib,
+         compressed_indices_norm_weight,
++        output,
++        local_kv,
++        compressed_kv,
++        gather,
++        combined_lse,
+         dout,
+         compression_rate,
+         num_topk_blocks,
+@@ -1653,9 +1693,15 @@ def _cute_compressed_sparse_attention_forward_op(
+     sliding_window_size: int,
+     rope_dims: int,
+     share_kv: bool,
+-) -> torch.Tensor:
++) -> tuple[
++    torch.Tensor,
++    torch.Tensor,
++    torch.Tensor,
++    torch.Tensor,
++    torch.Tensor,
++]:
+     with torch.cuda.device(Q.device):
+-        return _compressed_sparse_attention_forward(
++        output, state = _compressed_sparse_attention_forward(
+             Q,
+             Q_I,
+             KV,
+@@ -1681,7 +1727,10 @@ def _cute_compressed_sparse_attention_forward_op(
+             sliding_window_size,
+             rope_dims,
+             share_kv,
++            _return_state=True,
+         )
++        local_kv, compressed_kv, gather, _cos, _sin, combined_lse = state
++        return output, local_kv, compressed_kv, gather, combined_lse
+
+
+ @_cute_compressed_sparse_attention_forward_op.register_fake
+@@ -1732,18 +1781,71 @@ def _cute_compressed_sparse_attention_forward_fake(
+         compressed_indices_norm_weight,
+         compressed_kv_norm_weight,
+         attention_sink,
+-        compression_rate,
+-        num_topk_blocks,
+-        sliding_window_size,
+         rope_dims,
+         share_kv,
+     )
+-    return torch.empty_like(Q)
++    batch, heads, sequence, head_dim = Q.shape
++    num_blocks = (sequence + compression_rate - 1) // compression_rate
++    selectable_blocks = sequence // compression_rate
++    effective_topk = min(num_topk_blocks, selectable_blocks)
++    selected_window = min(sliding_window_size, sequence)
++    has_local = selected_window > 0
++    has_compressed = effective_topk > 0
++    local_kv = torch.empty(
++        batch,
++        sequence if has_local else 0,
++        1,
++        head_dim,
++        device=Q.device,
++        dtype=Q.dtype,
++    )
++    compressed_kv = torch.empty(
++        batch,
++        num_blocks if has_compressed else 0,
++        1,
++        head_dim,
++        device=Q.device,
++        dtype=Q.dtype,
++    )
++    combined_gather_length = (
++        (effective_topk + selected_window + 127) // 128 * 128 if has_compressed else 0
++    )
++    use_combined_attention = (
++        has_local
++        and has_compressed
++        and effective_topk <= 64
++        and _gather_storage_bytes(batch, sequence, combined_gather_length)
++        <= _COMBINED_GATHER_WORKSPACE_BYTES
++    )
++    gather_width = effective_topk + (selected_window if use_combined_attention else 0)
++    gather_length = (gather_width + 127) // 128 * 128 if has_compressed else 1
++    gather = torch.empty(
++        batch,
++        sequence,
++        gather_length,
++        device=Q.device,
++        dtype=torch.int32,
++    )
++    combined_lse = torch.empty(
++        batch,
++        sequence,
++        heads,
++        device=Q.device,
++        dtype=torch.float32,
++    )
++    return torch.empty_like(Q), local_kv, compressed_kv, gather, combined_lse
+
+
+ def _cute_compressed_sparse_attention_setup_context(ctx, inputs, output) -> None:
+-    del output
+-    ctx.save_for_backward(*inputs[:20])
++    primary_output, local_kv, compressed_kv, gather, combined_lse = output
++    ctx.save_for_backward(
++        *inputs[:20],
++        primary_output,
++        local_kv,
++        compressed_kv,
++        gather,
++        combined_lse,
++    )
+     (
+         ctx.compression_rate,
+         ctx.num_topk_blocks,
+@@ -1751,11 +1853,26 @@ def _cute_compressed_sparse_attention_setup_context(ctx, inputs, output) -> None
+         ctx.rope_dims,
+         ctx.share_kv,
+     ) = inputs[20:]
++    ctx.mark_non_differentiable(local_kv, compressed_kv, gather, combined_lse)
+
+
+-def _cute_compressed_sparse_attention_autograd_backward(ctx, dout):
++def _cute_compressed_sparse_attention_autograd_backward(
++    ctx,
++    dout,
++    _dlocal_kv,
++    _dcompressed_kv,
++    _dgather,
++    _dcombined_lse,
++):
++    saved_inputs = ctx.saved_tensors[:20]
++    output, local_kv, compressed_kv, gather, combined_lse = ctx.saved_tensors[20:]
+     grads = _cute_compressed_sparse_attention_backward(
+-        *ctx.saved_tensors,
++        *saved_inputs,
++        output,
++        local_kv,
++        compressed_kv,
++        gather,
++        combined_lse,
+         dout,
+         ctx.compression_rate,
+         ctx.num_topk_blocks,
+@@ -1838,7 +1955,10 @@ def compressed_sparse_attention(
+         value.detach() if index < 20 and index not in _DIFFERENTIABLE_INPUT_INDICES else value
+         for index, value in enumerate(args)
+     )
+-    return _cute_compressed_sparse_attention_forward_op(*operator_args)
++    output, _local_kv, _compressed_kv, _gather, _combined_lse = (
++        _cute_compressed_sparse_attention_forward_op(*operator_args)
++    )
++    return output
+
+
+ __all__ = ["compressed_sparse_attention"]
+diff --git a/attn_gym/sparse/heavily_compressed_attention/cute/__init__.py b/attn_gym/sparse/heavily_compressed_attention/cute/__init__.py
+index 40d1399..edf5ff0 100644
+--- a/attn_gym/sparse/heavily_compressed_attention/cute/__init__.py
++++ b/attn_gym/sparse/heavily_compressed_attention/cute/__init__.py
+@@ -512,7 +512,7 @@ def _heavily_compressed_attention_forward(
+         if device_index is None:
+             device_index = torch.cuda.current_device()
+         cos, sin = _rope_tables(device_index, sequence, rope_dims)
+-        empty_kv = torch.empty(
++        empty_local_kv = torch.empty(
+             batch,
+             0,
+             1,
+@@ -520,10 +520,17 @@ def _heavily_compressed_attention_forward(
+             device=Q.device,
+             dtype=Q.dtype,
+         )
++        empty_compressed_kv = torch.empty_like(empty_local_kv)
+         combined_lse = (
+             attention_sink.view(1, 1, heads).expand(batch, sequence, heads).float().contiguous()
+         )
+-        return output, (empty_kv, empty_kv, cos, sin, combined_lse)
++        return output, (
++            empty_local_kv,
++            empty_compressed_kv,
++            cos,
++            sin,
++            combined_lse,
++        )
+
+     if heads == 64 and _use_paired_h64_attention(
+         batch,
+@@ -872,6 +879,10 @@ def _heavily_compressed_attention_backward(
+     KV_norm_weight: torch.Tensor,
+     compressed_kv_norm_weight: torch.Tensor,
+     attention_sink: torch.Tensor,
++    output: torch.Tensor,
++    local_kv: torch.Tensor,
++    compressed_kv: torch.Tensor,
++    combined_lse: torch.Tensor,
+     dout: torch.Tensor,
+     compression_rate: int,
+     sliding_window_size: int,
+@@ -898,28 +909,10 @@ def _heavily_compressed_attention_backward(
+     dtype = cute_dtype(Q)
+     dsa_dtype = BFloat16
+     if has_attention:
+-        recompute_tensors = tuple(
+-            tensor.detach()
+-            for tensor in (
+-                Q,
+-                KV,
+-                C,
+-                Z,
+-                B,
+-                KV_norm_weight,
+-                compressed_kv_norm_weight,
+-                attention_sink,
+-            )
+-        )
+-        output, state = _heavily_compressed_attention_forward(
+-            *recompute_tensors,
+-            compression_rate,
+-            sliding_window_size,
+-            rope_dims,
+-            share_kv,
+-            _return_state=True,
+-        )
+-        local_kv, compressed_kv, cos, sin, combined_lse = state
++        device_index = Q.device.index
++        if device_index is None:
++            device_index = torch.cuda.current_device()
++        cos, sin = _rope_tables(device_index, sequence, rope_dims)
+         local_length = local_kv.shape[1]
+         # Compressed-only rows before q=R-1 have no visible KV at all. The
+         # vendored DSA kernel requires at least one real sparse row, so leave
+@@ -1250,6 +1243,10 @@ def _cute_heavily_compressed_attention_backward_op(
+     KV_norm_weight: torch.Tensor,
+     compressed_kv_norm_weight: torch.Tensor,
+     attention_sink: torch.Tensor,
++    output: torch.Tensor,
++    local_kv: torch.Tensor,
++    compressed_kv: torch.Tensor,
++    combined_lse: torch.Tensor,
+     dout: torch.Tensor,
+     compression_rate: int,
+     sliding_window_size: int,
+@@ -1275,6 +1272,10 @@ def _cute_heavily_compressed_attention_backward_op(
+             KV_norm_weight,
+             compressed_kv_norm_weight,
+             attention_sink,
++            output,
++            local_kv,
++            compressed_kv,
++            combined_lse,
+             dout,
+             compression_rate,
+             sliding_window_size,
+@@ -1293,6 +1294,10 @@ def _cute_heavily_compressed_attention_backward_fake(
+     KV_norm_weight,
+     compressed_kv_norm_weight,
+     attention_sink,
++    output,
++    local_kv,
++    compressed_kv,
++    combined_lse,
+     dout,
+     compression_rate,
+     sliding_window_size,
+@@ -1300,6 +1305,10 @@ def _cute_heavily_compressed_attention_backward_fake(
+     share_kv,
+ ):
+     del (
++        output,
++        local_kv,
++        compressed_kv,
++        combined_lse,
+         dout,
+         compression_rate,
+         sliding_window_size,
+@@ -1339,9 +1348,9 @@ def _cute_heavily_compressed_attention_forward_op(
+     sliding_window_size: int,
+     rope_dims: int,
+     share_kv: bool,
+-) -> torch.Tensor:
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+     with torch.cuda.device(Q.device):
+-        return _heavily_compressed_attention_forward(
++        output, state = _heavily_compressed_attention_forward(
+             Q,
+             KV,
+             C,
+@@ -1354,7 +1363,10 @@ def _cute_heavily_compressed_attention_forward_op(
+             sliding_window_size,
+             rope_dims,
+             share_kv,
++            _return_state=True,
+         )
++        local_kv, compressed_kv, _cos, _sin, combined_lse = state
++        return output, local_kv, compressed_kv, combined_lse
+
+
+ @_cute_heavily_compressed_attention_forward_op.register_fake
+@@ -1380,28 +1392,71 @@ def _cute_heavily_compressed_attention_forward_fake(
+         KV_norm_weight,
+         compressed_kv_norm_weight,
+         attention_sink,
+-        compression_rate,
+-        sliding_window_size,
+         rope_dims,
+         share_kv,
+     )
+-    return torch.empty_like(Q)
++    batch, heads, sequence, head_dim = Q.shape
++    local_sequence = sequence if sliding_window_size else 0
++    num_blocks = sequence // compression_rate
++    local_kv = torch.empty(
++        batch,
++        local_sequence,
++        1,
++        head_dim,
++        device=Q.device,
++        dtype=Q.dtype,
++    )
++    compressed_kv = torch.empty(
++        batch,
++        num_blocks,
++        1,
++        head_dim,
++        device=Q.device,
++        dtype=Q.dtype,
++    )
++    combined_lse = torch.empty(
++        batch,
++        sequence,
++        heads,
++        device=Q.device,
++        dtype=torch.float32,
++    )
++    return torch.empty_like(Q), local_kv, compressed_kv, combined_lse
+
+
+ def _cute_heavily_compressed_attention_setup_context(ctx, inputs, output) -> None:
+-    del output
+-    ctx.save_for_backward(*inputs[:_DIFFERENTIABLE_INPUTS])
++    primary_output, local_kv, compressed_kv, combined_lse = output
++    ctx.save_for_backward(
++        *inputs[:_DIFFERENTIABLE_INPUTS],
++        primary_output,
++        local_kv,
++        compressed_kv,
++        combined_lse,
++    )
+     (
+         ctx.compression_rate,
+         ctx.sliding_window_size,
+         ctx.rope_dims,
+         ctx.share_kv,
+     ) = inputs[_DIFFERENTIABLE_INPUTS:]
++    ctx.mark_non_differentiable(local_kv, compressed_kv, combined_lse)
+
+
+-def _cute_heavily_compressed_attention_autograd_backward(ctx, dout):
++def _cute_heavily_compressed_attention_autograd_backward(
++    ctx,
++    dout,
++    _dlocal_kv,
++    _dcompressed_kv,
++    _dcombined_lse,
++):
++    saved_inputs = ctx.saved_tensors[:_DIFFERENTIABLE_INPUTS]
++    output, local_kv, compressed_kv, combined_lse = ctx.saved_tensors[_DIFFERENTIABLE_INPUTS:]
+     grads = _cute_heavily_compressed_attention_backward_op(
+-        *ctx.saved_tensors,
++        *saved_inputs,
++        output,
++        local_kv,
++        compressed_kv,
++        combined_lse,
+         dout,
+         ctx.compression_rate,
+         ctx.sliding_window_size,
+@@ -1431,20 +1486,23 @@ def heavily_compressed_attention(
+     rope_dims: int,
+     share_kv: bool,
+ ) -> torch.Tensor:
+-    return _cute_heavily_compressed_attention_forward_op(
+-        Q,
+-        KV,
+-        C,
+-        Z,
+-        B,
+-        KV_norm_weight,
+-        compressed_kv_norm_weight,
+-        attention_sink,
+-        compression_rate,
+-        sliding_window_size,
+-        rope_dims,
+-        share_kv,
++    output, _local_kv, _compressed_kv, _combined_lse = (
++        _cute_heavily_compressed_attention_forward_op(
++            Q,
++            KV,
++            C,
++            Z,
++            B,
++            KV_norm_weight,
++            compressed_kv_norm_weight,
++            attention_sink,
++            compression_rate,
++            sliding_window_size,
++            rope_dims,
++            share_kv,
++        )
+     )
++    return output
+
+
+ __all__ = ["heavily_compressed_attention"]
+diff --git a/attn_gym/sparse/sliding_window_attention/cute/__init__.py b/attn_gym/sparse/sliding_window_attention/cute/__init__.py
+index fc2554c..0e762e5 100644
+--- a/attn_gym/sparse/sliding_window_attention/cute/__init__.py
++++ b/attn_gym/sparse/sliding_window_attention/cute/__init__.py
+@@ -221,9 +221,25 @@ def _sliding_window_attention_forward(
+         share_kv,
+     )
+     if sliding_window_size == 0:
+-        if _return_state:
+-            raise ValueError("Zero-window SWA has no backward attention state.")
+-        return torch.zeros_like(Q)
++        output = torch.zeros_like(Q)
++        if not _return_state:
++            return output
++        device_index = Q.device.index
++        if device_index is None:
++            device_index = torch.cuda.current_device()
++        cos, sin = _rope_tables(device_index, sequence, rope_dims)
++        empty_local_kv = torch.empty(
++            batch,
++            0,
++            1,
++            _HEAD_DIM,
++            device=Q.device,
++            dtype=Q.dtype,
++        )
++        combined_lse = (
++            attention_sink.view(1, 1, heads).expand(batch, sequence, heads).float().contiguous()
++        )
++        return output, (empty_local_kv, cos, sin, combined_lse)
+
+     window = min(sliding_window_size, sequence)
+     dtype = cute_dtype(Q)
+@@ -342,6 +358,9 @@ def _sliding_window_attention_backward(
+     KV: torch.Tensor,
+     KV_norm_weight: torch.Tensor,
+     attention_sink: torch.Tensor,
++    output: torch.Tensor,
++    local_kv: torch.Tensor,
++    combined_lse: torch.Tensor,
+     dout: torch.Tensor,
+     sliding_window_size: int,
+     rope_dims: int,
+@@ -364,17 +383,10 @@ def _sliding_window_attention_backward(
+             torch.zeros_like(attention_sink),
+         )
+
+-    output, state = _sliding_window_attention_forward(
+-        Q.detach(),
+-        KV.detach(),
+-        KV_norm_weight.detach(),
+-        attention_sink.detach(),
+-        sliding_window_size,
+-        rope_dims,
+-        share_kv,
+-        _return_state=True,
+-    )
+-    local_kv, cos, sin, combined_lse = state
++    device_index = Q.device.index
++    if device_index is None:
++        device_index = torch.cuda.current_device()
++    cos, sin = _rope_tables(device_index, sequence, rope_dims)
+     dtype = cute_dtype(Q)
+     dsa_dtype = BFloat16
+     tokens = batch * sequence
+@@ -581,6 +593,9 @@ def _cute_sliding_window_attention_backward(
+     KV: torch.Tensor,
+     KV_norm_weight: torch.Tensor,
+     attention_sink: torch.Tensor,
++    output: torch.Tensor,
++    local_kv: torch.Tensor,
++    combined_lse: torch.Tensor,
+     dout: torch.Tensor,
+     sliding_window_size: int,
+     rope_dims: int,
+@@ -592,6 +607,9 @@ def _cute_sliding_window_attention_backward(
+             KV,
+             KV_norm_weight,
+             attention_sink,
++            output,
++            local_kv,
++            combined_lse,
+             dout,
+             sliding_window_size,
+             rope_dims,
+@@ -605,12 +623,15 @@ def _cute_sliding_window_attention_backward_fake(
+     KV,
+     KV_norm_weight,
+     attention_sink,
++    output,
++    local_kv,
++    combined_lse,
+     dout,
+     sliding_window_size,
+     rope_dims,
+     share_kv,
+ ):
+-    del dout, sliding_window_size, rope_dims, share_kv
++    del output, local_kv, combined_lse, dout, sliding_window_size, rope_dims, share_kv
+     return tuple(torch.empty_like(tensor) for tensor in (Q, KV, KV_norm_weight, attention_sink))
+
+
+@@ -627,9 +648,9 @@ def _cute_sliding_window_attention_forward(
+     sliding_window_size: int,
+     rope_dims: int,
+     share_kv: bool,
+-) -> torch.Tensor:
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     with torch.cuda.device(Q.device):
+-        return _sliding_window_attention_forward(
++        output, state = _sliding_window_attention_forward(
+             Q,
+             KV,
+             KV_norm_weight,
+@@ -637,7 +658,10 @@ def _cute_sliding_window_attention_forward(
+             sliding_window_size,
+             rope_dims,
+             share_kv,
++            _return_state=True,
+         )
++        local_kv, _cos, _sin, combined_lse = state
++        return output, local_kv, combined_lse
+
+
+ @_cute_sliding_window_attention_forward.register_fake
+@@ -654,22 +678,64 @@ def _cute_sliding_window_attention_forward_fake(
+         KV,
+         KV_norm_weight,
+         attention_sink,
+-        sliding_window_size,
+         rope_dims,
+         share_kv,
+     )
+-    return torch.empty_like(Q)
++    batch, heads, sequence, head_dim = Q.shape
++    local_sequence = sequence if sliding_window_size else 0
++    local_kv = torch.empty(
++        batch,
++        local_sequence,
++        1,
++        head_dim,
++        device=Q.device,
++        dtype=Q.dtype,
++    )
++    combined_lse = torch.empty(
++        batch,
++        sequence,
++        heads,
++        device=Q.device,
++        dtype=torch.float32,
++    )
++    return torch.empty_like(Q), local_kv, combined_lse
+
+
+ def _cute_sliding_window_attention_setup_context(ctx, inputs, output) -> None:
+-    del output
+-    ctx.save_for_backward(*inputs[:4])
++    primary_output, local_kv, combined_lse = output
++    ctx.save_for_backward(
++        *inputs[:4],
++        primary_output,
++        local_kv,
++        combined_lse,
++    )
+     ctx.sliding_window_size, ctx.rope_dims, ctx.share_kv = inputs[4:]
++    ctx.mark_non_differentiable(local_kv, combined_lse)
+
+
+-def _cute_sliding_window_attention_autograd_backward(ctx, dout):
++def _cute_sliding_window_attention_autograd_backward(
++    ctx,
++    dout,
++    _dlocal_kv,
++    _dcombined_lse,
++):
++    (
++        Q,
++        KV,
++        KV_norm_weight,
++        attention_sink,
++        output,
++        local_kv,
++        combined_lse,
++    ) = ctx.saved_tensors
+     grads = _cute_sliding_window_attention_backward(
+-        *ctx.saved_tensors,
++        Q,
++        KV,
++        KV_norm_weight,
++        attention_sink,
++        output,
++        local_kv,
++        combined_lse,
+         dout,
+         ctx.sliding_window_size,
+         ctx.rope_dims,
+@@ -694,7 +760,7 @@ def sliding_window_attention(
+     share_kv: bool,
+ ) -> torch.Tensor:
+     """Dispatch the opaque CuTe forward/backward operators."""
+-    return _cute_sliding_window_attention_forward(
++    output, _local_kv, _combined_lse = _cute_sliding_window_attention_forward(
+         Q,
+         KV,
+         KV_norm_weight,
+@@ -703,6 +769,7 @@ def sliding_window_attention(
+         rope_dims,
+         share_kv,
+     )
++    return output
+
+
+ __all__ = ["sliding_window_attention"]
+diff --git a/test/test_compressed_sparse_attention_cute.py b/test/test_compressed_sparse_attention_cute.py
+index e4eeee5..7dae641 100755
+--- a/test/test_compressed_sparse_attention_cute.py
++++ b/test/test_compressed_sparse_attention_cute.py
+@@ -280,8 +280,10 @@ def assert_backward_matches_reference(base):
+     actual = compressed_sparse_attention(*cute_inputs, backend="cute")
+     saved = actual.grad_fn.saved_tensors
+     input_pointers = {value.data_ptr() for value in cute_inputs[:20]}
+-    assert len(saved) == 20
+-    assert all(value.data_ptr() in input_pointers for value in saved)
++    assert len(saved) == 25
++    assert all(value.data_ptr() in input_pointers for value in saved[:20])
++    assert saved[20].data_ptr() == actual.data_ptr()
++    assert all(value.data_ptr() not in input_pointers for value in saved[21:])
+     generator = torch.Generator(device=actual.device).manual_seed(456)
+     grad_output = (
+         torch.randn(actual.shape, device=actual.device, dtype=actual.dtype, generator=generator)
+diff --git a/test/test_heavily_compressed_attention_cute.py b/test/test_heavily_compressed_attention_cute.py
+index 101e7e3..cd714cf 100644
+--- a/test/test_heavily_compressed_attention_cute.py
++++ b/test/test_heavily_compressed_attention_cute.py
+@@ -205,8 +205,10 @@ def assert_backward_matches_reference(base):
+
+     saved = actual.grad_fn.saved_tensors
+     input_pointers = {value.data_ptr() for value in cute_inputs[:8]}
+-    assert len(saved) == 8
+-    assert all(value.data_ptr() in input_pointers for value in saved)
++    assert len(saved) == 12
++    assert all(value.data_ptr() in input_pointers for value in saved[:8])
++    assert saved[8].data_ptr() == actual.data_ptr()
++    assert all(value.data_ptr() not in input_pointers for value in saved[9:])
+
+     generator = torch.Generator(device=actual.device).manual_seed(456)
+     grad_output = (
+diff --git a/test/test_sliding_window_attention_cute.py b/test/test_sliding_window_attention_cute.py
+index 8711dc8..620354c 100644
+--- a/test/test_sliding_window_attention_cute.py
++++ b/test/test_sliding_window_attention_cute.py
+@@ -145,8 +145,10 @@ def assert_backward_matches_reference(base):
+
+     saved = actual.grad_fn.saved_tensors
+     input_pointers = {value.data_ptr() for value in cute_inputs[:4]}
+-    assert len(saved) == 4
+-    assert all(value.data_ptr() in input_pointers for value in saved)
++    assert len(saved) == 7
++    assert all(value.data_ptr() in input_pointers for value in saved[:4])
++    assert saved[4].data_ptr() == actual.data_ptr()
++    assert all(value.data_ptr() not in input_pointers for value in saved[5:])
+
+     generator = torch.Generator(device=actual.device).manual_seed(456)
+     grad_output = (

@@ -46,7 +46,10 @@ dev = [
 version = {file = "assets/version.txt"}
 
 [tool.codespell]
-skip = ["*.json"]
+skip = [
+    "*.json",
+    "torchtitan/models/deepseek_v4/attention_gym_state_retention.patch",
+]
 ignore-words-list = ["assertin", "datas" ,"indx", "inpt", "nd", "socio-economic"]
 
 # ---- Explicit project build information ---- #

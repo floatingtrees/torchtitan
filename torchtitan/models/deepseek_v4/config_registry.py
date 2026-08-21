@@ -17,12 +17,8 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw
-from torchtitan.config import (
-    CompileConfig,
-    DebugConfig,
-    ParallelismConfig,
-    TrainingConfig,
-)
+from torchtitan.components.quantization import MXFP8LinearConverter
+from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common import ComplexRoPE
 from torchtitan.tools.profiler import Profiler
@@ -113,7 +109,7 @@ def deepseek_large_debug_config() -> Trainer.Config:
         route_norm=False,
         route_scale=1.5,
         load_balance_coeff=1e-3,
-        moe_comm_backend="hybridep",
+        moe_comm_backend="standard",
         non_blocking_capacity_factor=None,
         rope=rope,
         rope_compress=compressed_rope,
@@ -144,4 +140,28 @@ def deepseek_large_debug_config() -> Trainer.Config:
         backend="inductor",
     )
     config.override.imports.append("torchtitan.models.deepseek_v4.attention_gym_csa")
+    return config
+
+
+def deepseek_large_debug_mxfp8_config() -> Trainer.Config:
+    """Large debug model with MXFP8 compute for its dominant query GEMMs.
+
+    Master weights and non-GEMM operations remain BF16. MXFP8Linear dynamically
+    quantizes its inputs and weights for GEMM execution.
+    """
+    config = deepseek_large_debug_config()
+    assert config.model_spec is not None
+
+    config.override.imports = ["torchtitan.models.deepseek_v4.attention_gym_hybrid"]
+    config.metrics = replace(config.metrics, log_freq=10)
+    config.debug = replace(config.debug, enable_structured_logging=False)
+
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    converter = MXFP8LinearConverter.Config(
+        model_compile_enabled=model_compile_enabled,
+        fqns=["attention.wq_b"],
+    ).build()
+    config.model_spec.model = converter.convert(config.model_spec.model)
     return config

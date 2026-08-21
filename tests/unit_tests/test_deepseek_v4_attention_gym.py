@@ -10,12 +10,14 @@ from unittest.mock import patch
 import torch
 
 import torchtitan.models.deepseek_v4.attention_gym as attention_gym_module
+import torchtitan.models.deepseek_v4.attention_gym_hybrid as hybrid_module
 from torchtitan.models.deepseek_v4.attention_gym import (
     _selected_attention_sharding_config,
     attention_gym,
     AttentionGymSelectedAttention,
     SelectedAttentionKernel,
 )
+from torchtitan.models.deepseek_v4.attention_gym_hybrid import AttentionGymAttention
 from torchtitan.models.deepseek_v4.config_registry import deepseek_large_debug_config
 
 
@@ -118,6 +120,50 @@ class TestDeepSeekV4SelectedAttentionOverride(unittest.TestCase):
 
         self.assertEqual(len(sharding.in_src_shardings), 5)
         self.assertEqual(len(sharding.local_map.in_grad_placements), 5)
+
+
+class TestDeepSeekV4HybridAttentionOverride(unittest.TestCase):
+    def test_factory_configures_swa_csa_and_hca_kernels(self):
+        model_config = deepseek_large_debug_config().model_spec.model
+
+        with patch.object(hybrid_module, "_ATTENTION_GYM_IMPORT_ERROR", None):
+            replacements = [
+                hybrid_module.attention_gym(layer.attention)
+                for layer in model_config.layers
+            ]
+
+        self.assertTrue(
+            all(
+                isinstance(replacement, AttentionGymAttention.Config)
+                for replacement in replacements
+            )
+        )
+        self.assertEqual(
+            [replacement.hca_kernel.compression_ratio for replacement in replacements],
+            [1, 4, 128, 4],
+        )
+        self.assertEqual(
+            len(replacements[0].swa_kernel.sharding_config.in_src_shardings), 4
+        )
+        self.assertEqual(
+            len(replacements[2].hca_kernel.sharding_config.in_src_shardings), 8
+        )
+
+    def test_factory_requires_sparse_attention_gym(self):
+        attention_config = (
+            deepseek_large_debug_config().model_spec.model.layers[0].attention
+        )
+        import_error = ImportError("No module named 'attn_gym'")
+
+        with (
+            patch.object(
+                hybrid_module,
+                "_ATTENTION_GYM_IMPORT_ERROR",
+                import_error,
+            ),
+            self.assertRaisesRegex(ImportError, "floatingtrees/attention-gym"),
+        ):
+            hybrid_module.attention_gym(attention_config)
 
 
 if __name__ == "__main__":

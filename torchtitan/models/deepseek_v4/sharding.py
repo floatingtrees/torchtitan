@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -102,9 +103,7 @@ def set_deepseek_v4_attention_sharding(attention_cfg, *, enable_sp):
         },
     )
 
-    set_dsa_flex_attention_sharding(
-        at.sparse_attn, compress_ratio=at.compress_ratio
-    )
+    set_dsa_flex_attention_sharding(at.sparse_attn, compress_ratio=at.compress_ratio)
 
     # Sub-module configs are declared as fields on Attention.Config, so we
     # can set sharding_config directly (same pattern as deepseek_v3).
@@ -180,16 +179,19 @@ def set_deepseek_v4_layer_sharding(
         state_shardings={
             n: _dense_param_rep
             for n in [
-                "hc_attn_fn", "hc_ffn_fn",
-                "hc_attn_base", "hc_ffn_base",
-                "hc_attn_scale", "hc_ffn_scale",
+                "hc_attn_fn",
+                "hc_ffn_fn",
+                "hc_attn_base",
+                "hc_ffn_base",
+                "hc_attn_scale",
+                "hc_ffn_scale",
             ]
         },
     )
     layer_cfg.sharding_config = hc_rep
 
-    layer_cfg.attention_norm.sharding_config = norm_config(enable_sp=False)
-    layer_cfg.ffn_norm.sharding_config = norm_config(enable_sp=False)
+    layer_cfg.attention_norm.sharding_config = norm_config(enable_sp=enable_sp)
+    layer_cfg.ffn_norm.sharding_config = norm_config(enable_sp=enable_sp)
     attn_x_layout = (
         dense_sequence_parallel_placement()
         if enable_sp
@@ -214,18 +216,18 @@ def set_deepseek_v4_layer_sharding(
             enable_sp=enable_sp,
             expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
         )
+        moe_sharding = layer_cfg.moe.sharding_config
+        assert moe_sharding is not None
+        assert moe_sharding.in_src_shardings is not None
+        assert moe_sharding.in_dst_shardings is not None
         input_ids_src_placement = dense_activation_placement(tp=spmd.R)
         input_ids_dst_placement = (
             dense_token_ids_sequence_parallel_placement()
             if enable_ep
             else dense_activation_placement(tp=spmd.R)
         )
-        layer_cfg.moe.sharding_config.in_src_shardings["input_ids"] = (
-            input_ids_src_placement
-        )
-        layer_cfg.moe.sharding_config.in_dst_shardings["input_ids"] = (
-            input_ids_dst_placement
-        )
+        moe_sharding.in_src_shardings["input_ids"] = input_ids_src_placement
+        moe_sharding.in_dst_shardings["input_ids"] = input_ids_dst_placement
 
 
 def set_deepseek_v4_sharding_config(
@@ -234,14 +236,11 @@ def set_deepseek_v4_sharding_config(
     enable_sp: bool,
     enable_ep: bool,
 ) -> None:
-    set_decoder_sharding_config(
-        config, enable_sp=enable_sp
-    )
+    set_decoder_sharding_config(config, enable_sp=enable_sp)
 
     hc_rep = ShardingConfig(
         state_shardings={
-            n: _dense_param_rep
-            for n in ["hc_head_fn", "hc_head_base", "hc_head_scale"]
+            n: _dense_param_rep for n in ["hc_head_fn", "hc_head_base", "hc_head_scale"]
         },
     )
     model_sharding = config.sharding_config or ShardingConfig()
@@ -249,4 +248,6 @@ def set_deepseek_v4_sharding_config(
     config.sharding_config = model_sharding
 
     for layer_cfg in config.layers:
-        set_deepseek_v4_layer_sharding(layer_cfg, enable_sp=enable_sp, enable_ep=enable_ep)
+        set_deepseek_v4_layer_sharding(
+            layer_cfg, enable_sp=enable_sp, enable_ep=enable_ep
+        )

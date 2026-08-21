@@ -227,6 +227,8 @@ class TestConfigManager(unittest.TestCase):
         model = config.model_spec.model
         assert model.n_layers == 4
         assert model.compress_ratios == (1, 4, 128, 4)
+        from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+
         for layer in model.layers:
             attention = layer.attention
             assert attention.n_heads == 128
@@ -239,6 +241,47 @@ class TestConfigManager(unittest.TestCase):
             assert layer.moe is not None
             assert layer.moe.router.top_k == 1
             assert layer.moe.experts.token_dispatcher.top_k == 1
+            assert isinstance(
+                layer.moe.experts.token_dispatcher,
+                AllToAllTokenDispatcher.Config,
+            )
+
+    @mock.patch(
+        "torchtitan.components.quantization.mx.has_cuda_capability",
+        return_value=True,
+    )
+    def test_deepseek_v4_large_debug_mxfp8_config(self, _mock_cuda_capability):
+        from torchtitan.components.quantization import MXFP8Linear
+
+        if MXFP8Linear is None:
+            pytest.skip("torchao MXFP8 support is not installed")
+
+        config_manager = ConfigManager()
+        config = config_manager.parse_args(
+            [
+                "--module",
+                "deepseek_v4",
+                "--config",
+                "deepseek_large_debug_mxfp8_config",
+            ]
+        )
+
+        assert config.training.dtype == "bfloat16"
+        assert config.metrics.log_freq == 10
+        assert not config.debug.enable_structured_logging
+        assert config.override.imports == [
+            "torchtitan.models.deepseek_v4.attention_gym_hybrid"
+        ]
+        quantized_fqns = [
+            fqn
+            for fqn, linear, _parent, _attr in config.model_spec.model.traverse(
+                MXFP8Linear.Config
+            )
+            if isinstance(linear, MXFP8Linear.Config)
+        ]
+        assert quantized_fqns == [
+            f"layers.{layer_id}.attention.wq_b" for layer_id in range(4)
+        ]
 
     def test_fqn_module_with_config_registry(self):
         """--module torchtitan.models.llama3.config_registry works."""

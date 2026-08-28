@@ -1,10 +1,16 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections.abc import Callable
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import dataclasses
+from collections.abc import Callable
 from functools import partial
 
 import torch.nn as nn
@@ -18,19 +24,13 @@ from torchtitan.models.common import (
     RMSNorm,
     RoPE,
 )
-from torchtitan.models.common.config_utils import (
-    make_experts_config,
-    make_ffn_config,
-)
+from torchtitan.models.common.config_utils import make_experts_config, make_ffn_config
 from torchtitan.models.common.param_init import depth_scaled_std
 from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .attention import (
-    Attention,
-    DSAFlexAttention,
-)
+from .attention import Attention, DSAFlexAttention
 from .model import DeepSeekV4Model, DeepSeekV4TransformerBlock
 from .moe import DeepSeekV4MoE, DeepSeekV4Router
 from .parallelize import parallelize_deepseek_v4, pipeline_deepseek_v4
@@ -66,6 +66,7 @@ def _depth_init(layer_id: int) -> dict[str, Callable]:
         "bias": nn.init.zeros_,
     }
 
+
 def _depth_experts_init(layer_id: int) -> dict[str, Callable]:
     return {
         "w1_EFD": partial(nn.init.trunc_normal_, std=0.02),
@@ -86,6 +87,7 @@ def _make_compressor_config(
     rope: RoPE.Config,
 ) -> "Compressor.Config":
     from .compressor import Compressor
+
     return Compressor.Config(
         dim=dim,
         rope=dataclasses.replace(rope),
@@ -95,20 +97,27 @@ def _make_compressor_config(
         rotate=rotate,
         norm_eps=norm_eps,
         wkv=Linear.Config(
-            in_features=dim, out_features=coff * head_dim, bias=False,
+            in_features=dim,
+            out_features=coff * head_dim,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         wgate=Linear.Config(
-            in_features=dim, out_features=coff * head_dim, bias=False,
+            in_features=dim,
+            out_features=coff * head_dim,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         norm=RMSNorm.Config(
-            normalized_shape=head_dim, eps=norm_eps,
+            normalized_shape=head_dim,
+            eps=norm_eps,
             param_init=_NORM_INIT,
         ),
         # ape holds a (compress_ratio, coff * head_dim) weight in a Linear.
         ape=Linear.Config(
-            in_features=coff * head_dim, out_features=compress_ratio, bias=False,
+            in_features=coff * head_dim,
+            out_features=compress_ratio,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
     )
@@ -127,6 +136,7 @@ def _make_indexer_config(
     rope: RoPE.Config,
 ) -> "Indexer.Config":
     from .compressor import Compressor, Indexer
+
     coff = 2  # overlap always True for indexer
     return Indexer.Config(
         dim=dim,
@@ -145,7 +155,9 @@ def _make_indexer_config(
             param_init=_LINEAR_INIT,
         ),
         weights_proj=Linear.Config(
-            in_features=dim, out_features=num_index_heads, bias=False,
+            in_features=dim,
+            out_features=num_index_heads,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         compressor=_make_compressor_config(
@@ -193,22 +205,37 @@ def _make_v4_attn_config(
     if compress_ratio == 4:
         coff = 2  # 1 + overlap (overlap=True when compress_ratio==4)
         compressor_cfg = _make_compressor_config(
-            dim=dim, head_dim=hd, rope_head_dim=rope_head_dim,
-            compress_ratio=compress_ratio, rotate=False,
-            norm_eps=norm_eps, coff=coff, rope=rope,
+            dim=dim,
+            head_dim=hd,
+            rope_head_dim=rope_head_dim,
+            compress_ratio=compress_ratio,
+            rotate=False,
+            norm_eps=norm_eps,
+            coff=coff,
+            rope=rope,
         )
         indexer_cfg = _make_indexer_config(
-            dim=dim, num_index_heads=index_n_heads,
-            index_head_dim=index_head_dim, index_topk=index_topk,
-            rope_head_dim=rope_head_dim, q_lora_rank=q_lora_rank,
-            compress_ratio=compress_ratio, norm_eps=norm_eps, rope=rope,
+            dim=dim,
+            num_index_heads=index_n_heads,
+            index_head_dim=index_head_dim,
+            index_topk=index_topk,
+            rope_head_dim=rope_head_dim,
+            q_lora_rank=q_lora_rank,
+            compress_ratio=compress_ratio,
+            norm_eps=norm_eps,
+            rope=rope,
         )
     elif compress_ratio > 1:
         coff = 1  # no overlap
         compressor_128_cfg = _make_compressor_config(
-            dim=dim, head_dim=hd, rope_head_dim=rope_head_dim,
-            compress_ratio=compress_ratio, rotate=False,
-            norm_eps=norm_eps, coff=coff, rope=rope,
+            dim=dim,
+            head_dim=hd,
+            rope_head_dim=rope_head_dim,
+            compress_ratio=compress_ratio,
+            rotate=False,
+            norm_eps=norm_eps,
+            coff=coff,
+            rope=rope,
         )
     sparse_attn_cfg = DSAFlexAttention.Config(
         window_size=window_size,
@@ -235,38 +262,52 @@ def _make_v4_attn_config(
         inner_attention=sparse_attn_cfg,
         rope=dataclasses.replace(rope),
         wq_a=Linear.Config(
-            in_features=dim, out_features=q_lora_rank, bias=False,
+            in_features=dim,
+            out_features=q_lora_rank,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         q_norm=RMSNorm.Config(
-            normalized_shape=q_lora_rank, eps=norm_eps,
+            normalized_shape=q_lora_rank,
+            eps=norm_eps,
             param_init=_NORM_INIT,
         ),
         wq_b=Linear.Config(
-            in_features=q_lora_rank, out_features=n_heads * hd, bias=False,
+            in_features=q_lora_rank,
+            out_features=n_heads * hd,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         wkv=Linear.Config(
-            in_features=dim, out_features=hd, bias=False,
+            in_features=dim,
+            out_features=hd,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         kv_norm=RMSNorm.Config(
-            normalized_shape=hd, eps=norm_eps,
+            normalized_shape=hd,
+            eps=norm_eps,
             param_init=_NORM_INIT,
         ),
         wo_a=Linear.Config(
-            in_features=per_group_in, out_features=per_group_out, bias=False,
+            in_features=per_group_in,
+            out_features=per_group_out,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         wo_b=Linear.Config(
-            in_features=per_group_out, out_features=dim, bias=False,
+            in_features=per_group_out,
+            out_features=dim,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         # attn_sink uses a Linear wrapper to hold a (n_heads, 1) weight; the
         # forward path squeezes it back to (n_heads,) to match the original
         # parameter semantics.
         attn_sink=Linear.Config(
-            in_features=1, out_features=n_heads, bias=False,
+            in_features=1,
+            out_features=n_heads,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         compressor=compressor_cfg,
@@ -580,11 +621,49 @@ def _flash(
     o_lora_rank = 1024
     n_groups = 8
     compress_ratios = (
-        1, 1, 4, 128, 4, 128, 4, 128, 4, 128,
-        4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-        4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-        4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-        4, 128, 1,
+        1,
+        1,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        1,
     )
     window_size = 128
     norm_eps = 1e-6
@@ -694,12 +773,66 @@ def _pro(
     o_lora_rank = 1024
     n_groups = 16
     compress_ratios = (
-        128, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-        4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-        4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-        4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-        4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-        4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+        128,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
         1,
     )
     window_size = 128

@@ -165,12 +165,10 @@ class FluxTokenizer(BaseTokenizer):
         self.is_clip = "clip" in model_path.lower()
 
         if self.is_clip:
-            # pyrefly: ignore [bad-assignment]
             self._tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(
                 model_path, max_length=max_length, **hf_kwargs
             )
         else:
-            # pyrefly: ignore [bad-assignment]
             self._tokenizer: T5Tokenizer = T5Tokenizer.from_pretrained(
                 model_path, max_length=max_length, **hf_kwargs
             )

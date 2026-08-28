@@ -44,6 +44,7 @@ def _gpt_oss_debugmodel(attn_backend: str = "varlen") -> Trainer.Config:
             local_batch_size=8,
             seq_len=2048,
             steps=10,
+            disable_cuda_graphs=True,
         ),
         parallelism=ParallelismConfig(
             expert_parallel_degree=1,
@@ -67,7 +68,9 @@ def gpt_oss_debugmodel() -> Trainer.Config:
 def gpt_oss_debugmodel_flex() -> Trainer.Config:
     # FlexAttention variant. Pipeline Parallel is incompatible with
     # VarlenAttention, so PP integration tests use this flex config.
-    return _gpt_oss_debugmodel(attn_backend="flex")
+    config = _gpt_oss_debugmodel(attn_backend="flex")
+    config.training.disable_cuda_graphs = False
+    return config
 
 
 def gpt_oss_20b() -> Trainer.Config:
@@ -92,6 +95,7 @@ def gpt_oss_20b() -> Trainer.Config:
             local_batch_size=1,
             seq_len=8192,
             steps=10000,
+            disable_cuda_graphs=True,
         ),
         parallelism=ParallelismConfig(
             expert_parallel_degree=1,
@@ -123,6 +127,7 @@ def gpt_oss_120b() -> Trainer.Config:
             local_batch_size=1,
             seq_len=8192,
             steps=10000,
+            disable_cuda_graphs=True,
         ),
         parallelism=ParallelismConfig(
             expert_parallel_degree=1,

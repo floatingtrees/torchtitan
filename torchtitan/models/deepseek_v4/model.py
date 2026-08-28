@@ -1,12 +1,17 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
-from functools import partial
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
 import dataclasses as dc
+from dataclasses import dataclass
+from functools import partial
 
 import torch
 from torch import nn
@@ -38,9 +43,7 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         self.attention_norm = (
             cfg.attention_norm.build() if cfg.attention_norm is not None else None
         )
-        self.ffn_norm = (
-            cfg.ffn_norm.build() if cfg.ffn_norm is not None else None
-        )
+        self.ffn_norm = cfg.ffn_norm.build() if cfg.ffn_norm is not None else None
         if cfg.moe is not None:
             self.moe = cfg.moe.build()
             self.feed_forward = None
@@ -74,14 +77,16 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
 
         if self._param_init is None:
             self._param_init = {}
-        self._param_init.update({
-            "hc_attn_fn": partial(_init_trunc_normal, std=0.02),
-            "hc_ffn_fn": partial(_init_trunc_normal, std=0.02),
-            "hc_attn_base": partial(_init_trunc_normal, std=0.02),
-            "hc_ffn_base": partial(_init_trunc_normal, std=0.02),
-            "hc_attn_scale": partial(_init_trunc_normal, std=0.02),
-            "hc_ffn_scale": partial(_init_trunc_normal, std=0.02),
-        })
+        self._param_init.update(
+            {
+                "hc_attn_fn": partial(_init_trunc_normal, std=0.02),
+                "hc_ffn_fn": partial(_init_trunc_normal, std=0.02),
+                "hc_attn_base": partial(_init_trunc_normal, std=0.02),
+                "hc_ffn_base": partial(_init_trunc_normal, std=0.02),
+                "hc_attn_scale": partial(_init_trunc_normal, std=0.02),
+                "hc_ffn_scale": partial(_init_trunc_normal, std=0.02),
+            }
+        )
 
     def _mhc_step(self, x, residual, hc_fn, hc_scale, hc_base, norm, fn, *a, **kw):
         x, post, comb = self.hc_pre(x, hc_fn, hc_scale, hc_base)
@@ -175,6 +180,7 @@ class DeepSeekV4Model(Decoder):
                 )
 
             from .sharding import set_deepseek_v4_sharding_config
+
             set_deepseek_v4_sharding_config(
                 self,
                 enable_sp=parallelism.enable_sequence_parallel,
@@ -191,7 +197,9 @@ class DeepSeekV4Model(Decoder):
             n_layers = self.n_layers
             head_dim = self.layers[0].attention.head_dim
             n_heads = self.layers[0].attention.n_heads
-            flops_per_token = 6 * non_embed_params + 12 * n_layers * n_heads * head_dim * seq_len
+            flops_per_token = (
+                6 * non_embed_params + 12 * n_layers * n_heads * head_dim * seq_len
+            )
             return total_params, int(flops_per_token)
 
     def __init__(self, config: Config):
@@ -216,11 +224,13 @@ class DeepSeekV4Model(Decoder):
 
         if self._param_init is None:
             self._param_init = {}
-        self._param_init.update({
-            "hc_head_fn": partial(_init_trunc_normal, std=0.02),
-            "hc_head_base": partial(_init_trunc_normal, std=0.02),
-            "hc_head_scale": partial(_init_trunc_normal, std=0.02),
-        })
+        self._param_init.update(
+            {
+                "hc_head_fn": partial(_init_trunc_normal, std=0.02),
+                "hc_head_base": partial(_init_trunc_normal, std=0.02),
+                "hc_head_scale": partial(_init_trunc_normal, std=0.02),
+            }
+        )
 
         self._dsa_loss_tracker = {}
 

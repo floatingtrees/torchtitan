@@ -17,12 +17,8 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw
-from torchtitan.config import (
-    CompileConfig,
-    DebugConfig,
-    ParallelismConfig,
-    TrainingConfig,
-)
+from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common import ComplexRoPE
 from torchtitan.tools.profiler import Profiler
@@ -136,7 +132,9 @@ def deepseek_large_debug_config() -> Trainer.Config:
         seq_len=4096,
         steps=126,
         dtype="bfloat16",
+        disable_cuda_graphs=False,
     )
+    config.activation_checkpoint = FullAC.Config()
     config.compile = replace(
         config.compile,
         enable=True,
@@ -157,7 +155,9 @@ def deepseek_v4_flash_config() -> Trainer.Config:
         seq_len=4096,
         steps=100,
         dtype="bfloat16",
+        disable_cuda_graphs=False,
     )
+    config.activation_checkpoint = FullAC.Config()
     config.compile = replace(
         config.compile,
         enable=True,
@@ -178,7 +178,9 @@ def deepseek_v4_pro_config() -> Trainer.Config:
         seq_len=4096,
         steps=100,
         dtype="bfloat16",
+        disable_cuda_graphs=False,
     )
+    config.activation_checkpoint = FullAC.Config()
     config.compile = replace(
         config.compile,
         enable=True,

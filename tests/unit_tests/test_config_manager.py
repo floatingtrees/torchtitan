@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
 import sys
 import unittest
 from unittest import mock
@@ -31,6 +32,51 @@ class TestConfigManager(unittest.TestCase):
         )
         assert config.model_spec.name == "llama3"
         assert config.model_spec.flavor == "debugmodel"
+
+    def test_cuda_graphs_enabled_by_default(self):
+        config = ConfigManager().parse_args(
+            ["--module", "llama3", "--config", "llama3_debugmodel"]
+        )
+        assert not config.training.disable_cuda_graphs
+
+    def test_cuda_graphs_reject_unsupported_expert_parallelism(self):
+        from torchtitan.models.deepseek_v3.config_registry import deepseek_v3_debugmodel
+
+        config = deepseek_v3_debugmodel()
+        config.parallelism.expert_parallel_degree = 2
+        with pytest.raises(ValueError, match="without CPU synchronization"):
+            dataclasses.replace(config)
+
+    def test_cuda_graphs_allow_non_blocking_hybridep(self):
+        config = ConfigManager().parse_args(
+            [
+                "--module",
+                "deepseek_v3",
+                "--config",
+                "deepseek_v3_debugmodel_hybridep",
+                "--parallelism.expert_parallel_degree",
+                "2",
+            ]
+        )
+        assert not config.training.disable_cuda_graphs
+
+    def test_cuda_graphs_reject_blocking_hybridep(self):
+        from torchtitan.models.common.token_dispatcher import HybridEPTokenDispatcher
+        from torchtitan.models.deepseek_v3.config_registry import (
+            deepseek_v3_debugmodel_hybridep,
+        )
+
+        config = deepseek_v3_debugmodel_hybridep()
+        dispatcher_configs = list(
+            config.model_spec.model.traverse(HybridEPTokenDispatcher.Config)
+        )
+        assert dispatcher_configs
+        for _, dispatcher_config, _, _ in dispatcher_configs:
+            dispatcher_config.non_blocking_capacity_factor = None
+        config.parallelism.expert_parallel_degree = 2
+
+        with pytest.raises(ValueError, match="non_blocking_capacity_factor"):
+            dataclasses.replace(config)
 
     def test_parse_args_uses_current_sys_argv(self):
         """parse_args() without args reads sys.argv at call time."""
@@ -225,8 +271,8 @@ class TestConfigManager(unittest.TestCase):
         ]
 
         model = config.model_spec.model
-        assert model.n_layers == 4
-        assert model.compress_ratios == (1, 4, 128, 4)
+        assert model.n_layers == 8
+        assert model.compress_ratios == (1, 4, 128, 4) * 2
         for layer in model.layers:
             attention = layer.attention
             assert attention.n_heads == 128

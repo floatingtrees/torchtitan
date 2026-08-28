@@ -21,6 +21,7 @@ def build_transformers_modeling_backend_test_list() -> list[OverrideDefinitions]
         OverrideDefinitions(
             [
                 [
+                    "--training.disable_cuda_graphs",
                     "--module transformers_modeling_backend",
                     "--config transformers_modeling_backend_debugmodel",
                     "--hf_model Qwen/Qwen2.5-7B",

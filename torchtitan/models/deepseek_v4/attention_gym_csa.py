@@ -11,12 +11,25 @@
 
 """Attention Gym CuTe DSL overrides for all DeepSeek V4 attention layers.
 
-Install the validated ``floatingtrees/attention-gym`` revision, then activate
-this module with::
+Install the validated dependencies and ``floatingtrees/attention-gym``
+revision, then activate this module with::
 
-    pip install "attn_gym[sparse] @ git+https://github.com/floatingtrees/attention-gym.git@dev/dsv4-ref"
+    python -m pip install \\
+      'protobuf==6.33.6' \\
+      'cuda-python==13.3.1' \\
+      'apache-tvm-ffi==0.1.13.post3' \\
+      'torch-c-dlpack-ext==0.1.5' \\
+      'nvidia-cutlass-dsl[cu13]==4.6.2' \\
+      'quack-kernels[cu13]==0.6.4' \\
+      'flash-attn-4[cu13]==4.0.0b17' \\
+      'nvidia-cudnn-frontend[cutedsl]==1.27.0'
+    python -m pip install --no-deps \\
+      'attn_gym @ git+https://github.com/floatingtrees/attention-gym.git@d54b0f2883a100202ab0f69d6a1caea52b17012c'
 
     --override.imports torchtitan.models.deepseek_v4.attention_gym_csa
+
+Do not use the Attention Gym ``sparse`` extra for this revision. It pins older,
+incompatible CuTe DSL dependencies.
 
 All three DeepSeek V4 attention patterns are routed to SM100 CuTe DSL kernels:
 
@@ -37,6 +50,7 @@ This override intentionally omits both until the kernel supports them.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Any, cast
 
 import spmd_types as spmd
 import torch
@@ -56,18 +70,31 @@ from .compressor import Compressor
 # R: compression ratio.
 
 try:
-    from attn_gym.sparse.compressed_sparse_attention.cute import (
-        compressed_sparse_attention as _compressed_sparse_attention_cute,
+    from attn_gym.sparse.compressed_sparse_attention import (
+        cute as _compressed_sparse_attention_cute_module,
     )
-    from attn_gym.sparse.heavily_compressed_attention.cute import (
-        heavily_compressed_attention as _heavily_compressed_attention_cute,
+    from attn_gym.sparse.heavily_compressed_attention import (
+        cute as _heavily_compressed_attention_cute_module,
     )
-    from attn_gym.sparse.sliding_window_attention.cute import (
-        sliding_window_attention as _sliding_window_attention_cute,
+    from attn_gym.sparse.sliding_window_attention import (
+        cute as _sliding_window_attention_cute_module,
+    )
+
+    _compressed_sparse_attention_cute = (
+        _compressed_sparse_attention_cute_module.compressed_sparse_attention
+    )
+    _heavily_compressed_attention_cute = (
+        _heavily_compressed_attention_cute_module.heavily_compressed_attention
+    )
+    _sliding_window_attention_cute = (
+        _sliding_window_attention_cute_module.sliding_window_attention
     )
 
     _ATTENTION_GYM_IMPORT_ERROR: ImportError | None = None
 except ImportError as error:
+    _compressed_sparse_attention_cute_module = None
+    _heavily_compressed_attention_cute_module = None
+    _sliding_window_attention_cute_module = None
     _compressed_sparse_attention_cute = None
     _heavily_compressed_attention_cute = None
     _sliding_window_attention_cute = None
@@ -77,6 +104,58 @@ except ImportError as error:
 DP = MeshAxisName.DP
 CP = MeshAxisName.CP
 TP = MeshAxisName.TP
+
+
+def _make_rope_tables_capture_safe(module: Any) -> None:
+    if getattr(module, "_torchtitan_capture_safe_rope_tables", False):
+        return
+
+    original_rope_tables = module._rope_tables
+    ready_streams: dict[tuple[int, int, int], torch.cuda.Stream] = {}
+
+    def rope_tables(
+        device_index: int,
+        sequence_length: int,
+        rope_dims: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (device_index, sequence_length, rope_dims)
+        device = torch.device("cuda", device_index)
+        consumer_stream = torch.cuda.current_stream(device)
+        if not torch.cuda.is_current_stream_capturing():
+            result = original_rope_tables(device_index, sequence_length, rope_dims)
+            # The original helper waits for its cache event before returning, so
+            # this stream can consume the immutable tables without another wait.
+            ready_streams[key] = consumer_stream
+            return result
+
+        cached = module._rope_table_cache.get(key)
+        if cached is None or ready_streams.get(key) != consumer_stream:
+            raise RuntimeError(
+                "Attention Gym RoPE tables must be warmed up on the CUDA graph "
+                "capture stream before capture begins."
+            )
+
+        # Waiting on the event cached by the eager warmup is illegal during CUDA
+        # graph capture. The warmup used this same stream and already waited for
+        # the tables, so only allocator stream tracking is needed here.
+        cos, sin, _ = cached
+        cos.record_stream(consumer_stream)
+        sin.record_stream(consumer_stream)
+        return cos, sin
+
+    module._rope_tables = rope_tables
+    module._torchtitan_capture_safe_rope_tables = True
+
+
+def _prepare_attention_gym_for_cuda_graphs() -> None:
+    modules = (
+        _compressed_sparse_attention_cute_module,
+        _heavily_compressed_attention_cute_module,
+        _sliding_window_attention_cute_module,
+    )
+    for module in modules:
+        assert module is not None
+        _make_rope_tables_capture_safe(module)
 
 
 def _activation_layout(
@@ -320,32 +399,35 @@ class AttentionGymCSAKernel(Module):
         attention_sink_H: torch.Tensor,
     ) -> torch.Tensor:
         assert _compressed_sparse_attention_cute is not None
-        return _compressed_sparse_attention_cute(
-            q_BHLD,
-            q_index_BILJ,
-            kv_B1LD,
-            c_a_B1LD,
-            c_b_B1LD,
-            z_a_B1LD,
-            z_b_B1LD,
-            b_a_RD,
-            b_b_RD,
-            index_weight_BLI,
-            k_index_a_B1LJ,
-            k_index_b_B1LJ,
-            z_index_a_B1LJ,
-            z_index_b_B1LJ,
-            b_index_a_RJ,
-            b_index_b_RJ,
-            kv_norm_weight_D,
-            index_norm_weight_J,
-            compressed_kv_norm_weight_D,
-            attention_sink_H,
-            self.compression_ratio,
-            self.num_topk_blocks,
-            self.sliding_window_size,
-            self.rope_dims,
-            True,
+        return cast(
+            torch.Tensor,
+            _compressed_sparse_attention_cute(
+                q_BHLD,
+                q_index_BILJ,
+                kv_B1LD,
+                c_a_B1LD,
+                c_b_B1LD,
+                z_a_B1LD,
+                z_b_B1LD,
+                b_a_RD,
+                b_b_RD,
+                index_weight_BLI,
+                k_index_a_B1LJ,
+                k_index_b_B1LJ,
+                z_index_a_B1LJ,
+                z_index_b_B1LJ,
+                b_index_a_RJ,
+                b_index_b_RJ,
+                kv_norm_weight_D,
+                index_norm_weight_J,
+                compressed_kv_norm_weight_D,
+                attention_sink_H,
+                self.compression_ratio,
+                self.num_topk_blocks,
+                self.sliding_window_size,
+                self.rope_dims,
+                True,
+            ),
         )
 
 
@@ -561,7 +643,9 @@ class AttentionGymCSAAttention(Attention):
         )
         return self._project_output(out_BHLD)
 
-    def forward(self, x_BLM, attention_masks=None, positions=None):
+    def forward(  # pyrefly: ignore [bad-param-name-override]
+        self, x_BLM, attention_masks=None, positions=None
+    ):
         if self.compress_ratio == 1 and hasattr(self, "swa_kernel"):
             return self._forward_swa(x_BLM)
         elif self.compress_ratio == 4 and hasattr(self, "csa_kernel"):
@@ -583,6 +667,8 @@ def attention_gym_csa(cfg: Attention.Config) -> AttentionGymCSAAttention.Config:
             "The DeepSeek V4 CSA override requires the floatingtrees/attention-gym "
             "fork to be installed."
         ) from _ATTENTION_GYM_IMPORT_ERROR
+
+    _prepare_attention_gym_for_cuda_graphs()
 
     swa_kernel = None
     csa_kernel = None

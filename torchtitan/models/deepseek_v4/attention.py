@@ -1,4 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -337,14 +343,16 @@ class Attention(BaseAttention):
             base = torch.arange(seqlen, device=x.device).unsqueeze(1)
             compress_causal_limit = (base + 1) // self.compress_ratio
             compress_causal_mask = (
-                torch.arange(
-                    seqlen // self.compress_ratio, device=x.device
-                ).unsqueeze(0)
+                torch.arange(seqlen // self.compress_ratio, device=x.device).unsqueeze(
+                    0
+                )
                 >= compress_causal_limit
             )
             compress_topk_idxs, _ = self.indexer(
-                x.detach(), qr.detach(),
-                compress_causal_mask, compress_causal_limit,
+                x.detach(),
+                qr.detach(),
+                compress_causal_mask,
+                compress_causal_limit,
                 positions=positions,
                 offset=kv.size(1),
             )
@@ -362,7 +370,11 @@ class Attention(BaseAttention):
                 (bsz, seqlen, 0), dtype=torch.int64, device=x.device
             )
         o = self.sparse_attn(
-            q, kv, attn_sink_param, kv_compress, compress_topk_idxs,
+            q,
+            kv,
+            attn_sink_param,
+            kv_compress,
+            compress_topk_idxs,
         )
 
         o_nope, o_rope = torch.split(o, [self.head_dim - rd, rd], dim=-1)

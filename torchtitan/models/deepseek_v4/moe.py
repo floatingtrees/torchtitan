@@ -1,4 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -9,15 +15,18 @@ import torch
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
-from torchtitan.models.common.nn_modules import Linear
 from torchtitan.models.common.moe import MoE, TokenChoiceTopKRouter
+
+from torchtitan.models.common.nn_modules import Linear
 
 
 def _softplus_stable(x):
     return torch.log1p(torch.exp(-x.abs())) + torch.relu(x)
 
 
-def _build_hash_routing_table(vocab_size, num_experts, top_k, device=None, chunk_size=8192):
+def _build_hash_routing_table(
+    vocab_size, num_experts, top_k, device=None, chunk_size=8192
+):
     if top_k > num_experts:
         raise ValueError(f"top_k ({top_k}) must be <= num_experts ({num_experts})")
     tid2eid = torch.empty((vocab_size, top_k), dtype=torch.long, device=device)
@@ -34,9 +43,7 @@ def _build_hash_routing_table(vocab_size, num_experts, top_k, device=None, chunk
 @torch.library.custom_op(
     "deepseek_v4::hash_route", mutates_args=(), device_types="cuda"
 )
-def _hash_route(
-    routing_table: torch.Tensor, input_ids: torch.Tensor
-) -> torch.Tensor:
+def _hash_route(routing_table: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
     return routing_table[input_ids]
 
 
@@ -84,7 +91,9 @@ class DeepSeekV4Router(TokenChoiceTopKRouter):
                 buffer_device = self.tid2eid.device
             with torch.device(buffer_device):
                 self.tid2eid = _build_hash_routing_table(
-                    self.vocab_size, self.num_experts, self.top_k,
+                    self.vocab_size,
+                    self.num_experts,
+                    self.top_k,
                     device=buffer_device,
                 )
 
@@ -132,9 +141,10 @@ class DeepSeekV4Router(TokenChoiceTopKRouter):
         top_scores = scores.gather(dim=-1, index=selected_experts_indices)
 
         if self._debug_force_load_balance:
-            selected_experts_indices, top_scores = self._debug_force_load_balance_routing(
-                scores
-            )
+            (
+                selected_experts_indices,
+                top_scores,
+            ) = self._debug_force_load_balance_routing(scores)
 
         if self.route_norm:
             denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20

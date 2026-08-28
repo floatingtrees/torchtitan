@@ -1,4 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -212,7 +218,9 @@ def test_pipeline_deepseek_v4_rejects_hc_head_parameter_before_last_stage():
     with mock.patch(
         "torchtitan.models.deepseek_v4.parallelize.pipeline_llm",
     ) as pipeline_llm:
-        with pytest.raises(ValueError, match="direct parameters only on the last stage"):
+        with pytest.raises(
+            ValueError, match="direct parameters only on the last stage"
+        ):
             pipeline_deepseek_v4(
                 model,
                 parallel_dims=SimpleNamespace(pp=2),

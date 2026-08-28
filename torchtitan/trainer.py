@@ -44,9 +44,19 @@ from torchtitan.distributed.activation_checkpoint import (
     SelectiveAC,
 )
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+from torchtitan.distributed.cudagraph import (
+    cudagraph_teardown,
+    ForwardBackwardFn,
+    wrap_with_cuda_graph,
+)
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
 from torchtitan.models.common.attention import FlexAttention, VarlenAttention
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.token_dispatcher import (
+    HybridEPTokenDispatcher,
+    LocalTokenDispatcher,
+    MinimalAsyncEPTokenDispatcher,
+)
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_spec import ModelSpec
@@ -147,6 +157,48 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     "--compile.components."
                 )
 
+            self._validate_cuda_graphs()
+
+        def _validate_cuda_graphs(self) -> None:
+            if self.training.disable_cuda_graphs:
+                return
+
+            if self.parallelism.pipeline_parallel_degree > 1:
+                raise ValueError(
+                    "CUDA graphs do not support pipeline parallelism yet. "
+                    "Set --training.disable_cuda_graphs."
+                )
+
+            if self.parallelism.fsdp_reshard_after_forward == "always":
+                raise ValueError(
+                    "CUDA graphs do not support FSDP reshard_after_forward=always. "
+                    "Use the default or never policy, or set "
+                    "--training.disable_cuda_graphs."
+                )
+
+            if self.parallelism.expert_parallel_degree == 1 or self.model_spec is None:
+                return
+
+            for _, dispatcher_config, _, _ in self.model_spec.model.traverse(
+                LocalTokenDispatcher.Config
+            ):
+                if isinstance(
+                    dispatcher_config, MinimalAsyncEPTokenDispatcher.Config
+                ) or (
+                    isinstance(dispatcher_config, HybridEPTokenDispatcher.Config)
+                    and dispatcher_config.non_blocking_capacity_factor is not None
+                ):
+                    continue
+
+                raise ValueError(
+                    "CUDA graphs support only expert parallel token dispatcher "
+                    "configurations without CPU synchronization. "
+                    "Set HybridEP non_blocking_capacity_factor, or use "
+                    "MinimalAsyncEP, or set --training.disable_cuda_graphs. "
+                    "Unsupported token "
+                    f"dispatcher: {type(dispatcher_config).__qualname__}."
+                )
+
         def to_dict(self) -> dict[str, Any]:
             d = {}
             for f in dataclasses.fields(self):
@@ -210,6 +262,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     device: torch.device
     gc_handler: utils.GarbageCollection
     train_context: dist_utils.SpmdContext
+    fwd_bwd_fn: ForwardBackwardFn
     gradient_accumulation_steps: int
     pp_has_first_stage: bool
     pp_has_last_stage: bool
@@ -291,6 +344,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # loss, dataloader, …) are built later in __init__.
         if config.override.imports:
             apply_overrides(config.override, config)
+        config._validate_cuda_graphs()
 
         logger.info(f"Building {model_spec.name} {model_spec.flavor}")
 
@@ -530,6 +584,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 and config.debug.spmd_typechecking
             ),
         )
+        self.fwd_bwd_fn = self._forward_backward_body
+        if not config.training.disable_cuda_graphs:
+            self.fwd_bwd_fn = wrap_with_cuda_graph(self.fwd_bwd_fn)
 
         # Build validator if validation is configured
         if config.validator.enable:
@@ -699,7 +756,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         *,
         input_dict: dict[str, torch.Tensor],
         labels: torch.Tensor,
-        global_valid_tokens: float,
+        global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         model_parts = self.model_parts
         parallel_dims = self.parallel_dims
@@ -742,22 +799,32 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         else:
             # Non-PP forward / backward
             assert len(model_parts) == 1
-            with self.train_context():
-                pred = model_parts[0](inputs, **extra_kwargs)
-                loss, _ = self.loss_fn(pred, labels, global_valid_tokens)
-                del pred
-                with spmd.no_typecheck():
-                    # this propagates types through BWD, causing unnecessary conflicts
-                    # between torch_function and internals (e.g. AC). FWD is sufficient.
-                    loss.backward()
+            loss = self.fwd_bwd_fn(inputs, labels, global_valid_tokens, extra_kwargs)
 
         # The returned loss here is local SUM loss / global_valid_tokens
+        return loss
+
+    def _forward_backward_body(
+        self,
+        inputs: torch.Tensor,
+        labels: torch.Tensor,
+        global_valid_tokens: torch.Tensor,
+        extra_kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        with self.train_context():
+            pred = self.model_parts[0](inputs, **extra_kwargs)
+            loss, _ = self.loss_fn(pred, labels, global_valid_tokens)
+            del pred
+            with spmd.no_typecheck():
+                # this propagates types through BWD, causing unnecessary conflicts
+                # between torch_function and internals (e.g. AC). FWD is sufficient.
+                loss.backward()
         return loss
 
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
-        self.optimizers.zero_grad()
+        self.optimizers.zero_grad(set_to_none=self.config.training.disable_cuda_graphs)
         # Save per-optimizer-group learning rates for logging
         lr_metrics = self.lr_schedulers.get_metrics()
 
@@ -775,15 +842,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 microbatches.append((input_dict, labels))
         sl.log_trace_scalar({"local_valid_tokens": int(local_valid_tokens)})
 
-        # All-reduce to get global token count across DP ranks
-        # Move to GPU for distributed communication
+        # Keep the global token count on device so loss normalization does not
+        # introduce a CPU synchronization in the training path.
+        global_valid_tokens = local_valid_tokens.to(self.device)
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
-            global_valid_tokens = dist_utils.dist_sum(
-                local_valid_tokens.to(self.device), batch_mesh
+            global_valid_tokens = dist_utils.dist_sum_tensor(
+                global_valid_tokens, batch_mesh
             )
-        else:
-            global_valid_tokens = float(local_valid_tokens.item())
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
@@ -938,6 +1004,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.ntokens_seen = state_dict["ntokens_seen"]
 
     def close(self) -> None:
+        if not self.config.training.disable_cuda_graphs:
+            cudagraph_teardown()
         if hasattr(self, "checkpointer") and self.checkpointer:
             self.checkpointer.close()
         if hasattr(self, "metrics_processor") and self.metrics_processor:

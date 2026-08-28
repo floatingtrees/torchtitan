@@ -93,6 +93,7 @@ real expert-parallel collectives. Enable it only with `aot_fx_trace` and
 ```bash
 NGPU=8 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_debugmodel \
     ./run_train.sh \
+    --training.disable_cuda_graphs \
     --compile.mode aot_fx_trace \
     --compile.ep_overlap.enabled \
     --compile.ep_overlap.strategy graph \
@@ -148,6 +149,7 @@ DeepSeek V3 debug model:
 
 ```bash
 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_debugmodel ./run_train.sh \
+  --training.disable_cuda_graphs \
   --compile.mode aot_fx_trace \
   --compile.enable_autoparallel \
   --parallelism.data_parallel_shard_degree 4 \
@@ -208,6 +210,7 @@ NGPU=8 MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_debugmodel \
 python -m torchtitan.experiments.graph_trainer.precompile_main \
     --module graph_trainer.deepseek_v3 \
     --config graph_trainer_deepseek_v3_debugmodel \
+    --training.disable_cuda_graphs \
     --compile.precompile_artifact_dir /tmp/dsv3_precompile_artifacts \
     --parallelism.data_parallel_shard_degree 4 \
     --parallelism.tensor_parallel_degree 2 \
@@ -216,6 +219,7 @@ python -m torchtitan.experiments.graph_trainer.precompile_main \
 # Step 2: load and train with torchrun (uses all GPUs)
 NGPU=8 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_debugmodel \
     ./torchtitan/experiments/graph_trainer/run_train_precompile.sh \
+    --training.disable_cuda_graphs \
     --compile.precompile_artifact_dir /tmp/dsv3_precompile_artifacts \
     --parallelism.data_parallel_shard_degree 4 \
     --parallelism.tensor_parallel_degree 2 \

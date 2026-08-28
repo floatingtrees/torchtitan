@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from typing import cast
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -19,24 +21,31 @@ from torchtitan.models.deepseek_v4.attention_gym import (
     AttentionGymHCAKernel,
     AttentionGymSWAKernel,
 )
-from torchtitan.models.deepseek_v4.attention_gym_csa import AttentionGymCSAKernel
+from torchtitan.models.deepseek_v4.attention_gym_csa import (
+    _make_rope_tables_capture_safe,
+    AttentionGymCSAKernel,
+)
 from torchtitan.models.deepseek_v4.config_registry import deepseek_large_debug_config
+from torchtitan.models.deepseek_v4.model import DeepSeekV4Model
 
 
 class TestDeepSeekV4AttentionGymOverride(unittest.TestCase):
     def test_large_debug_config_exercises_all_attention_types(self):
-        model_config = deepseek_large_debug_config().model_spec.model
+        config = deepseek_large_debug_config()
+        assert config.model_spec is not None
+        model_config = cast(DeepSeekV4Model.Config, config.model_spec.model)
 
-        self.assertEqual(model_config.compress_ratios, (1, 4, 128, 4))
+        self.assertEqual(model_config.compress_ratios, (1, 4, 128, 4) * 2)
         self.assertEqual(
             [layer.attention.n_heads for layer in model_config.layers],
-            [128, 128, 128, 128],
+            [128] * 8,
         )
 
     def test_factory_adds_all_kernel_configs(self):
-        attention_config = (
-            deepseek_large_debug_config().model_spec.model.layers[2].attention
-        )
+        config = deepseek_large_debug_config()
+        assert config.model_spec is not None
+        model_config = cast(DeepSeekV4Model.Config, config.model_spec.model)
+        attention_config = model_config.layers[2].attention
 
         with patch.object(
             attention_gym_module,
@@ -46,6 +55,9 @@ class TestDeepSeekV4AttentionGymOverride(unittest.TestCase):
             replacement = attention_gym(attention_config)
 
         self.assertIsInstance(replacement, AttentionGymAttention.Config)
+        assert replacement.csa_kernel is not None
+        assert replacement.hca_kernel is not None
+        assert replacement.swa_kernel is not None
         self.assertEqual(replacement.csa_kernel.compression_ratio, 128)
         self.assertEqual(replacement.hca_kernel.compression_ratio, 128)
         self.assertEqual(
@@ -54,9 +66,10 @@ class TestDeepSeekV4AttentionGymOverride(unittest.TestCase):
         )
 
     def test_factory_requires_attention_gym(self):
-        attention_config = (
-            deepseek_large_debug_config().model_spec.model.layers[0].attention
-        )
+        config = deepseek_large_debug_config()
+        assert config.model_spec is not None
+        model_config = cast(DeepSeekV4Model.Config, config.model_spec.model)
+        attention_config = model_config.layers[0].attention
         import_error = ImportError("No module named 'attn_gym'")
 
         with (
@@ -132,6 +145,12 @@ class TestDeepSeekV4AttentionGymOverride(unittest.TestCase):
     def test_local_map_grad_placements_cover_every_tensor_input(self):
         hca_sharding = _hca_sharding_config()
         swa_sharding = _swa_sharding_config()
+        assert hca_sharding.in_src_shardings is not None
+        assert hca_sharding.local_map is not None
+        assert swa_sharding.in_src_shardings is not None
+        assert swa_sharding.local_map is not None
+        assert hca_sharding.local_map.in_grad_placements is not None
+        assert swa_sharding.local_map.in_grad_placements is not None
 
         self.assertEqual(len(hca_sharding.in_src_shardings), 8)
         self.assertEqual(
@@ -143,6 +162,44 @@ class TestDeepSeekV4AttentionGymOverride(unittest.TestCase):
             len(swa_sharding.local_map.in_grad_placements),
             4,
         )
+
+    def test_rope_tables_reuse_warmup_stream_during_capture(self):
+        key = (0, 1024, 64)
+        cos = Mock()
+        sin = Mock()
+        original = Mock(return_value=(cos, sin))
+        stream = Mock()
+        module = SimpleNamespace(
+            _rope_tables=original,
+            _rope_table_cache={key: (cos, sin, Mock())},
+        )
+        _make_rope_tables_capture_safe(module)
+
+        with (
+            patch("torch.cuda.current_stream", return_value=stream),
+            patch("torch.cuda.is_current_stream_capturing", side_effect=(False, True)),
+        ):
+            self.assertEqual(module._rope_tables(*key), (cos, sin))
+            self.assertEqual(module._rope_tables(*key), (cos, sin))
+
+        original.assert_called_once_with(*key)
+        cos.record_stream.assert_called_once_with(stream)
+        sin.record_stream.assert_called_once_with(stream)
+
+    def test_rope_tables_require_warmup_on_capture_stream(self):
+        key = (0, 1024, 64)
+        module = SimpleNamespace(
+            _rope_tables=Mock(),
+            _rope_table_cache={key: (Mock(), Mock(), Mock())},
+        )
+        _make_rope_tables_capture_safe(module)
+
+        with (
+            patch("torch.cuda.current_stream", return_value=Mock()),
+            patch("torch.cuda.is_current_stream_capturing", return_value=True),
+            self.assertRaisesRegex(RuntimeError, "must be warmed up"),
+        ):
+            module._rope_tables(*key)
 
 
 if __name__ == "__main__":

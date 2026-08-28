@@ -86,6 +86,7 @@ def _build_precompile_tests() -> list[PrecompileTestDefinition]:
                 " --module graph_trainer.deepseek_v3"
                 " --config graph_trainer_deepseek_v3_debugmodel"
                 " --compile.mode aot_fx_trace"
+                " --training.disable_cuda_graphs"
                 f" --compile.precompile_artifact_dir {dsv3_fx_trace_precompile_dir}"
                 " --parallelism.data_parallel_shard_degree 4"
                 " --parallelism.tensor_parallel_degree 2"
@@ -95,6 +96,7 @@ def _build_precompile_tests() -> list[PrecompileTestDefinition]:
                 "--module graph_trainer.deepseek_v3",
                 "--config graph_trainer_deepseek_v3_debugmodel",
                 "--compile.mode aot_fx_trace",
+                "--training.disable_cuda_graphs",
                 f"--compile.precompile_artifact_dir {dsv3_fx_trace_precompile_dir}",
                 "--parallelism.data_parallel_shard_degree 4",
                 "--parallelism.tensor_parallel_degree 2",

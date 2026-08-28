@@ -60,6 +60,7 @@ def qwen35_debugmodel() -> Trainer.Config:
             local_batch_size=1,
             seq_len=512,
             steps=10,
+            disable_cuda_graphs=True,
         ),
         checkpoint=CheckpointManager.Config(
             interval=10,
@@ -88,6 +89,7 @@ def qwen35_debugmodel_moe() -> Trainer.Config:
             local_batch_size=2,
             seq_len=512,
             steps=10,
+            disable_cuda_graphs=True,
         ),
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=2,
@@ -121,6 +123,7 @@ def qwen35_0_8b() -> Trainer.Config:
             local_batch_size=4,
             seq_len=4096,
             steps=1000,
+            disable_cuda_graphs=True,
         ),
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,
@@ -151,6 +154,7 @@ def qwen35_2b() -> Trainer.Config:
             local_batch_size=4,
             seq_len=4096,
             steps=1000,
+            disable_cuda_graphs=True,
         ),
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,
@@ -181,6 +185,7 @@ def qwen35_4b() -> Trainer.Config:
             local_batch_size=4,
             seq_len=4096,
             steps=1000,
+            disable_cuda_graphs=True,
         ),
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,
@@ -210,6 +215,7 @@ def qwen35_9b() -> Trainer.Config:
             local_batch_size=4,
             seq_len=4096,
             steps=1000,
+            disable_cuda_graphs=True,
         ),
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,
@@ -241,6 +247,7 @@ def qwen35_27b() -> Trainer.Config:
             local_batch_size=4,
             seq_len=4096,
             steps=1000,
+            disable_cuda_graphs=True,
         ),
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,
@@ -272,6 +279,7 @@ def qwen35_35b_a3b() -> Trainer.Config:
             local_batch_size=4,
             seq_len=4096,
             steps=1000,
+            disable_cuda_graphs=True,
         ),
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,
@@ -304,6 +312,7 @@ def qwen35_122b_a10b() -> Trainer.Config:
             local_batch_size=4,
             seq_len=4096,
             steps=1000,
+            disable_cuda_graphs=True,
         ),
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,
@@ -336,6 +345,7 @@ def qwen35_397b_a17b() -> Trainer.Config:
             local_batch_size=4,
             seq_len=4096,
             steps=1000,
+            disable_cuda_graphs=True,
         ),
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,

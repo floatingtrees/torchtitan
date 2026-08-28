@@ -1,4 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -16,7 +22,9 @@ from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
 
-def _make_hadamard_mat(n: int, device: torch.device | str | None = None) -> torch.Tensor:
+def _make_hadamard_mat(
+    n: int, device: torch.device | str | None = None
+) -> torch.Tensor:
     n_pow2 = 2 ** math.ceil(math.log2(n))
     H = torch.tensor([[1.0, 1.0], [1.0, -1.0]], device=device)
     for _ in range(int(math.log2(n_pow2)) - 1):
@@ -81,9 +89,9 @@ class Compressor(Module):
         if positions is not None:
             comp_positions = positions[:, ::ratio]
         else:
-            comp_positions = torch.arange(
-                0, seqlen, ratio, device=x.device
-            ).unsqueeze(0)
+            comp_positions = torch.arange(0, seqlen, ratio, device=x.device).unsqueeze(
+                0
+            )
         kv = kv.unflatten(1, (-1, ratio))
         score = score.unflatten(1, (-1, ratio)) + self.ape.weight
         if self.overlap:
@@ -92,9 +100,9 @@ class Compressor(Module):
         kv = (kv * score.softmax(dim=2)).sum(dim=2)
         kv = self.norm(kv.to(dtype))
         kv_nope, kv_rope = torch.split(kv, [self.head_dim - rd, rd], dim=-1)
-        kv_rope = self.rope(
-            kv_rope.unsqueeze(2), kv_rope.unsqueeze(2), comp_positions
-        )[0]
+        kv_rope = self.rope(kv_rope.unsqueeze(2), kv_rope.unsqueeze(2), comp_positions)[
+            0
+        ]
         kv = torch.cat([kv_nope, kv_rope.squeeze(2)], dim=-1)
         return kv
 
@@ -137,9 +145,7 @@ class Indexer(Module):
         if buffer_device is None:
             buffer_device = self.hadamard_mat.device
         with torch.device(buffer_device):
-            self.hadamard_mat = _make_hadamard_mat(
-                self.head_dim, device=buffer_device
-            )
+            self.hadamard_mat = _make_hadamard_mat(self.head_dim, device=buffer_device)
 
     @staticmethod
     def _rotate_activation(x, hadamard_mat):
@@ -174,7 +180,9 @@ class Indexer(Module):
         q = self._rotate_activation(q, hadamard_mat)
         k = self.compressor(x, positions=positions)
         k = self._rotate_activation(k, hadamard_mat)
-        weights = self.weights_proj(x) * (self.softmax_scale * self.num_index_heads**-0.5)
+        weights = self.weights_proj(x) * (
+            self.softmax_scale * self.num_index_heads**-0.5
+        )
         index_score = torch.einsum("bshd,btd->bsht", q, k)
         index_score = index_score.relu_() * weights.unsqueeze(-1)
         index_score = index_score.sum(dim=2)

@@ -137,8 +137,8 @@ jobs:
         echo "Checking Qwen3 MoE FSDP+TP+EP loss parity against reference"
         python3 scripts/loss_compare.py . . \
           --baseline-module=qwen3 --baseline-config=qwen3_moe_debug \
-          --baseline-options="--parallelism.tensor_parallel_degree 2 --parallelism.expert_parallel_degree 4" \
-          --test-options="--parallelism.tensor_parallel_degree 2 --parallelism.expert_parallel_degree 4" \
+          --baseline-options="--training.disable_cuda_graphs --parallelism.tensor_parallel_degree 2 --parallelism.expert_parallel_degree 4" \
+          --test-options="--training.disable_cuda_graphs --parallelism.tensor_parallel_degree 2 --parallelism.expert_parallel_degree 4" \
           --job-dump-folder="${RUNNER_TEMP}/artifacts-to-be-uploaded/moe_loss_comparison" \
           --import-result="${MOE_LOSS_FILE}" --assert-equal --steps=100
         rm -rf $RUNNER_TEMP/artifacts-to-be-uploaded/*

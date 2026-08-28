@@ -6,9 +6,8 @@
 
 """Attention Gym hybrid attention override for DeepSeek V4.
 
-Install the validated Attention Gym revision, then activate this module with::
-
-    pip install "attn_gym[sparse] @ git+https://github.com/floatingtrees/attention-gym.git@336ea6ce6aa53c8300b8136d3a4de4cf9d09b9b1"
+Install the dependency versions documented in ``attention_gym_csa``, then
+activate this module with::
 
     --override.imports torchtitan.models.deepseek_v4.attention_gym
 
@@ -38,6 +37,7 @@ from .attention import Attention
 from .attention_gym_csa import (
     _activation_layout,
     _csa_sharding_config,
+    _prepare_attention_gym_for_cuda_graphs,
     _rename_attention_input_sharding,
     AttentionGymCSAAttention,
     AttentionGymCSAKernel,
@@ -205,11 +205,12 @@ class AttentionGymAttention(AttentionGymCSAAttention):
 
     @dataclass(kw_only=True, slots=True)
     class Config(AttentionGymCSAAttention.Config):
-        hca_kernel: AttentionGymHCAKernel.Config
-        swa_kernel: AttentionGymSWAKernel.Config
+        pass
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
+        assert config.hca_kernel is not None
+        assert config.swa_kernel is not None
         self.hca_kernel = config.hca_kernel.build()
         self.swa_kernel = config.swa_kernel.build()
 
@@ -257,6 +258,8 @@ def attention_gym(cfg: Attention.Config) -> AttentionGymAttention.Config:
             "The DeepSeek V4 Attention Gym override requires the "
             "floatingtrees/attention-gym fork with sparse dependencies."
         ) from _ATTENTION_GYM_IMPORT_ERROR
+
+    _prepare_attention_gym_for_cuda_graphs()
 
     csa_kernel = AttentionGymCSAKernel.Config(
         compression_ratio=cfg.compress_ratio,

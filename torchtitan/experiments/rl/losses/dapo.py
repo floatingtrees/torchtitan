@@ -57,7 +57,7 @@ class DAPOLoss(BaseLoss):
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
-        global_valid_tokens: float | None = None,
+        global_valid_tokens: torch.Tensor | float | None = None,
         *,
         generator_logprobs: torch.Tensor,
         advantages: torch.Tensor,

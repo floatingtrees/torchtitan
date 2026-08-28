@@ -201,7 +201,7 @@ class Trainer(ForgeEngine):
         *,
         input_dict: dict[str, torch.Tensor],
         labels: torch.Tensor,
-        global_valid_tokens: float,
+        global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         model_parts = self.model_parts
         parallel_dims = self.parallel_dims
@@ -274,15 +274,14 @@ class Trainer(ForgeEngine):
             local_valid_tokens += (labels != IGNORE_INDEX).sum()
             microbatches.append((input_dict, labels))
 
-        # All-reduce to get global token count across DP ranks
-        # Move to GPU for distributed communication
+        # Keep the global token count on device so loss normalization does not
+        # introduce a CPU synchronization in the training path.
+        global_valid_tokens = local_valid_tokens.to(self.device)
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
-            global_valid_tokens = dist_utils.dist_sum(
-                local_valid_tokens.to(self.device), batch_mesh
+            global_valid_tokens = dist_utils.dist_sum_tensor(
+                global_valid_tokens, batch_mesh
             )
-        else:
-            global_valid_tokens = float(local_valid_tokens.item())
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []

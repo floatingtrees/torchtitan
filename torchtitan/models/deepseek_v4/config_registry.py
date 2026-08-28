@@ -63,7 +63,7 @@ def deepseek_v4_debugmodel() -> Trainer.Config:
     )
 
 
-def deepseek_large_debug_config() -> Trainer.Config:
+def _deepseek_large_debug_config(*, moe_comm_backend: str) -> Trainer.Config:
     config = deepseek_v4_debugmodel()
     assert config.model_spec is not None
 
@@ -109,7 +109,7 @@ def deepseek_large_debug_config() -> Trainer.Config:
         route_norm=False,
         route_scale=1.5,
         load_balance_coeff=1e-3,
-        moe_comm_backend="standard",
+        moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=None,
         rope=rope,
         rope_compress=compressed_rope,
@@ -142,6 +142,21 @@ def deepseek_large_debug_config() -> Trainer.Config:
         backend="inductor",
     )
     config.override.imports.append("torchtitan.models.deepseek_v4.attention_gym_csa")
+    return config
+
+
+def deepseek_large_debug_config() -> Trainer.Config:
+    return _deepseek_large_debug_config(moe_comm_backend="standard")
+
+
+def deepseek_large_debug_minimal_async_ep_config() -> Trainer.Config:
+    config = _deepseek_large_debug_config(moe_comm_backend="minimal_async_ep")
+    config.parallelism = replace(
+        config.parallelism,
+        expert_parallel_degree=2,
+        enable_sequence_parallel=False,
+    )
+    config.override.imports.append("torchtitan.overrides.fused_swiglu")
     return config
 
 

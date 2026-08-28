@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import pytest
+import torch
 from torchtitan.config import ConfigManager
 
 
@@ -285,6 +286,41 @@ class TestConfigManager(unittest.TestCase):
             assert layer.moe is not None
             assert layer.moe.router.top_k == 1
             assert layer.moe.experts.token_dispatcher.top_k == 1
+
+    def test_deepseek_v4_large_debug_minimal_async_ep_config(self):
+        from torchtitan.distributed.activation_checkpoint import FullAC
+        from torchtitan.models.common.token_dispatcher import (
+            MinimalAsyncEPTokenDispatcher,
+        )
+
+        config = ConfigManager().parse_args(
+            [
+                "--module",
+                "deepseek_v4",
+                "--config",
+                "deepseek_large_debug_minimal_async_ep_config",
+            ]
+        )
+
+        assert config.parallelism.data_parallel_shard_degree == -1
+        assert config.parallelism.expert_parallel_degree == 2
+        assert not config.parallelism.enable_sequence_parallel
+        assert not config.training.disable_cuda_graphs
+        assert isinstance(config.activation_checkpoint, FullAC.Config)
+        assert config.override.imports == [
+            "torchtitan.models.deepseek_v4.attention_gym_csa",
+            "torchtitan.overrides.fused_swiglu",
+        ]
+
+        dispatcher_configs = list(
+            config.model_spec.model.traverse(MinimalAsyncEPTokenDispatcher.Config)
+        )
+        assert len(dispatcher_configs) == 8
+        config.model_spec.model.update_from_config(config=config)
+        for _, dispatcher_config, _, _ in dispatcher_configs:
+            assert dispatcher_config.hidden_dim == 256
+            assert dispatcher_config.tokens_per_rank == 8 * 4096
+            assert dispatcher_config.dtype == torch.bfloat16
 
     def test_fqn_module_with_config_registry(self):
         """--module torchtitan.models.llama3.config_registry works."""

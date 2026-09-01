@@ -204,6 +204,7 @@ class Indexer(Module):
         index_score = index_score + torch.where(
             compress_causal_mask, torch.finfo(idx_q.dtype).min, 0
         )
-        _, topk_indices = index_score.topk(min(topk, seqlen // ratio), dim=-1)
-        selected_indexer_logits = index_score.gather(-1, topk_indices)
+        selected_indexer_logits, topk_indices = index_score.topk(
+            min(topk, seqlen // ratio), dim=-1
+        )
         return topk_indices, selected_indexer_logits

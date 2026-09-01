@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from attn_gym.sparse.selected_attention import AuxRequest, selected_attention
 from torch.nn.attention.flex_attention import BlockMask
 
-from torchtitan.distributed.utils import get_spmd_backend
+from torchtitan.distributed.utils import dist_sum_tensor, get_spmd_backend
 from torchtitan.models.common.attention import BaseAttention, FlexAttention
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
@@ -206,16 +206,25 @@ class SlidingWindowAttention(DSV4FlexAttention):
 
 class _InjectAuxLoss(torch.autograd.Function):
     @staticmethod
-    def forward(*args, **kwargs):
-        ctx, carrier, aux_loss = args
+    # pyrefly: ignore [bad-override]
+    def forward(
+        ctx,
+        carrier: torch.Tensor,
+        aux_loss: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
         ctx.save_for_backward(aux_loss)
+        ctx.scale = scale
         return carrier
 
     @staticmethod
-    def backward(*args, **kwargs):
-        ctx, grad_output = args
+    # pyrefly: ignore [bad-override]
+    def backward(
+        ctx,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, None]:
         (aux_loss,) = ctx.saved_tensors
-        return grad_output, torch.ones_like(aux_loss)
+        return grad_output, torch.full_like(aux_loss, ctx.scale), None
 
 
 def _indexer_loss(
@@ -224,6 +233,8 @@ def _indexer_loss(
     attention_lse_BNT,
     selected_indexer_logits_BTK,
     selected_is_valid_BTK,
+    *,
+    tp_group=None,
 ):
     compressed_attention_logits_BNTK = (
         torch.einsum(
@@ -238,6 +249,11 @@ def _indexer_loss(
     ).sum(dim=1)
     valid_BTK = selected_is_valid_BTK.float()
     compressed_teacher_mass_BTK = compressed_teacher_mass_BTK * valid_BTK
+    if tp_group is not None:
+        compressed_teacher_mass_BTK = dist_sum_tensor(
+            compressed_teacher_mass_BTK,
+            extra_pg=tp_group,
+        )
     eps = torch.finfo(torch.float32).tiny
     compressed_teacher_probs_BTK = (
         compressed_teacher_mass_BTK
@@ -252,13 +268,15 @@ def _indexer_loss(
         masked_indexer_logits_BTK,
         torch.zeros_like(masked_indexer_logits_BTK),
     )
-    indexer_probs_BTK = F.softmax(masked_indexer_logits_BTK, dim=-1)
+    indexer_log_probs_BTK = F.log_softmax(masked_indexer_logits_BTK, dim=-1)
+    indexer_log_probs_BTK = torch.where(
+        selected_is_valid_BTK,
+        indexer_log_probs_BTK,
+        torch.zeros_like(indexer_log_probs_BTK),
+    )
     kl_BT = (
         compressed_teacher_probs_BTK
-        * (
-            compressed_teacher_probs_BTK.clamp_min(eps).log()
-            - indexer_probs_BTK.clamp_min(eps).log()
-        )
+        * (compressed_teacher_probs_BTK.clamp_min(eps).log() - indexer_log_probs_BTK)
     ).sum(dim=-1)
     valid_kl_BT = torch.where(row_has_valid_BT, kl_BT, torch.zeros_like(kl_BT))
     return valid_kl_BT.sum() / row_has_valid_BT.sum().clamp_min(1)
@@ -277,6 +295,7 @@ class DSV4SelectedAttention(Module):
         super().__init__()
         self.window_size = config.window_size
         self.compress_ratio = config.compress_ratio
+        self.softmax_scale = config.softmax_scale
         self.index_topk = config.index_topk
         self.backend = config.backend
 
@@ -290,6 +309,8 @@ class DSV4SelectedAttention(Module):
         *,
         return_lse,
     ):
+        if self.softmax_scale != q.shape[-1] ** -0.5:
+            raise ValueError("selected_attention requires softmax_scale=head_dim**-0.5")
         q_BNTD = q.transpose(0, 1).unsqueeze(0)
         swa_k_BNTD = swa_k.unsqueeze(0).unsqueeze(0)
         cmp_k_BNCD = cmp_k.unsqueeze(0).unsqueeze(0)
@@ -375,6 +396,16 @@ class CompressedSparseAttention(DSV4SelectedAttention):
     class Config(DSV4SelectedAttention.Config):
         pass
 
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self.indexer_loss_scale = 1.0
+        self.tp_group = None
+
+    def parallelize(self, parallel_dims) -> None:
+        if parallel_dims.tp_enabled:
+            self.tp_group = parallel_dims.get_dense_tp_mesh().get_group()
+        super().parallelize(parallel_dims)
+
     def forward(
         self,
         q,
@@ -392,6 +423,7 @@ class CompressedSparseAttention(DSV4SelectedAttention):
                 "CompressedSparseAttention does not accept attention_masks"
             )
         with spmd.no_typecheck():
+            compute_indexer_loss = self.training and torch.is_grad_enabled()
             seqlen = q.shape[0]
             kv_indices_TK, selected_indexer_logits_TK = Indexer.select(
                 idx_q,
@@ -406,7 +438,6 @@ class CompressedSparseAttention(DSV4SelectedAttention):
                 // self.compress_ratio
             )
             selected_is_valid_TK = kv_indices_TK < causal_limit_T1
-            selected_compressed_kv_TKD = cmp_k[kv_indices_TK]
             causal_kv_indices_TK = torch.where(selected_is_valid_TK, kv_indices_TK, -1)
             out_BNTD, attention_lse_BNT = self._forward_selected(
                 q,
@@ -414,16 +445,23 @@ class CompressedSparseAttention(DSV4SelectedAttention):
                 cmp_k,
                 causal_kv_indices_TK,
                 attn_sink,
-                return_lse=True,
+                return_lse=compute_indexer_loss,
             )
-            aux_loss = _indexer_loss(
-                q.transpose(0, 1).unsqueeze(0),
-                selected_compressed_kv_TKD.unsqueeze(0),
-                attention_lse_BNT,
-                selected_indexer_logits_TK.unsqueeze(0),
-                selected_is_valid_TK.unsqueeze(0),
-            )
-            out_BNTD = _InjectAuxLoss.apply(out_BNTD, aux_loss)
+            if compute_indexer_loss:
+                selected_compressed_kv_TKD = cmp_k[kv_indices_TK]
+                aux_loss = _indexer_loss(
+                    q.transpose(0, 1).unsqueeze(0),
+                    selected_compressed_kv_TKD.unsqueeze(0),
+                    attention_lse_BNT,
+                    selected_indexer_logits_TK.unsqueeze(0),
+                    selected_is_valid_TK.unsqueeze(0),
+                    tp_group=self.tp_group,
+                )
+                out_BNTD = _InjectAuxLoss.apply(
+                    out_BNTD,
+                    aux_loss,
+                    self.indexer_loss_scale,
+                )
         return self._finish_output(out_BNTD, q)
 
 
@@ -431,8 +469,8 @@ class Attention(BaseAttention):
     """DeepSeek V4 attention wrapper around sparse inner attention.
 
     The module projects Q/KV, applies pre- and post-phase RoPE, prepares
-    optional compressed/indexer tensors, and delegates sparse attention to
-    ``DSV4FlexAttention``.
+    optional compressed/indexer tensors, and delegates to the configured
+    sparse attention implementation.
     """
 
     @dataclass(kw_only=True, slots=True)

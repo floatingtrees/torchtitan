@@ -12,6 +12,9 @@ from functools import partial
 import torch.nn as nn
 
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
+from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import (
     ComplexRoPE,
@@ -26,9 +29,7 @@ from torchtitan.models.common.config_utils import (
     make_routed_experts_config,
 )
 from torchtitan.models.common.param_init import depth_scaled_std
-from torchtitan.models.deepseek_v3.parallelize import (
-    parallelize_deepseekv3 as parallelize_deepseek_v4,
-)
+from torchtitan.models.deepseek_v3.parallelize import parallelize_deepseekv3
 from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
@@ -63,6 +64,55 @@ _HC_INIT = {
     "hc_base": partial(nn.init.trunc_normal_, std=0.02),
     "hc_scale": partial(nn.init.trunc_normal_, std=0.02),
 }
+
+
+def _get_indexer_loss_scale(
+    training: TrainingConfig,
+    parallel_dims: ParallelDims,
+    parallelism: ParallelismConfig,
+) -> float:
+    num_microbatch_tokens = training.num_tokens_per_microbatch_per_dp_rank
+    num_train_step_tokens = training.num_tokens_per_train_step
+    if num_train_step_tokens < 0:
+        num_pp_microbatches = (
+            parallelism.num_pp_microbatches if parallel_dims.pp_enabled else 1
+        )
+        num_train_step_tokens = (
+            num_microbatch_tokens
+            * num_pp_microbatches
+            * parallel_dims.dp_replicate
+            * parallel_dims.dp_shard
+        )
+    return num_microbatch_tokens / num_train_step_tokens
+
+
+def parallelize_deepseek_v4(
+    model: DeepSeekV4Model,
+    *,
+    parallel_dims: ParallelDims,
+    training: TrainingConfig,
+    parallelism: ParallelismConfig,
+    compile_config: CompileConfig,
+    ac_config: ActivationCheckpointingConfig,
+    dump_folder: str,
+) -> nn.Module:
+    indexer_loss_scale = _get_indexer_loss_scale(
+        training,
+        parallel_dims,
+        parallelism,
+    )
+    for module in model.modules():
+        if isinstance(module, CompressedSparseAttention):
+            module.indexer_loss_scale = indexer_loss_scale
+    return parallelize_deepseekv3(
+        model,
+        parallel_dims=parallel_dims,
+        training=training,
+        parallelism=parallelism,
+        compile_config=compile_config,
+        ac_config=ac_config,
+        dump_folder=dump_folder,
+    )
 
 
 def _output_linear_init(dim: int) -> dict[str, Callable]:

@@ -188,7 +188,7 @@ class Indexer(Module):
         seqlen: int,
         ratio: int,
         topk: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Select top-k compressed positions per folded query token."""
         index_score = torch.einsum("shd,td->sht", idx_q, idx_k)
         index_score = index_score.relu_() * idx_w.unsqueeze(-1)
@@ -205,4 +205,5 @@ class Indexer(Module):
             compress_causal_mask, torch.finfo(idx_q.dtype).min, 0
         )
         _, topk_indices = index_score.topk(min(topk, seqlen // ratio), dim=-1)
-        return topk_indices
+        selected_indexer_logits = index_score.gather(-1, topk_indices)
+        return topk_indices, selected_indexer_logits

@@ -26,12 +26,12 @@ from torchtitan.models.common.config_utils import (
     make_routed_experts_config,
 )
 from torchtitan.models.common.param_init import depth_scaled_std
-from torchtitan.models.utils import validate_converter_order
-from torchtitan.protocols.model import ModelConfigConverter
-from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.models.deepseek_v3.parallelize import (
     parallelize_deepseekv3 as parallelize_deepseek_v4,
 )
+from torchtitan.models.utils import validate_converter_order
+from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.protocols.model_spec import ModelSpec
 
 from .attention import (
     Attention,
@@ -41,8 +41,8 @@ from .attention import (
 )
 from .mhc import HcHead, HcPost, HcPre
 from .model import DeepSeekV4Model, DeepSeekV4TransformerBlock
-from .mtp import MTPBlock
 from .moe import DeepSeekV4MoE, DeepSeekV4Router
+from .mtp import MTPBlock
 from .state_dict_adapter import DeepSeekV4StateDictAdapter
 
 __all__ = [
@@ -232,17 +232,28 @@ def _make_v4_attn_config(
             rope=rope,
         )
     if compress_ratio == 4:
-        inner_attention_cls = CompressedSparseAttention
+        inner_attention_cfg = CompressedSparseAttention.Config(
+            window_size=window_size,
+            compress_ratio=compress_ratio,
+            softmax_scale=softmax_scale,
+            index_topk=index_topk,
+            backend="cute" if head_dim == 512 else "triton",
+        )
     elif compress_ratio > 1:
-        inner_attention_cls = HeavilyCompressedAttention
+        inner_attention_cfg = HeavilyCompressedAttention.Config(
+            window_size=window_size,
+            compress_ratio=compress_ratio,
+            softmax_scale=softmax_scale,
+            index_topk=index_topk,
+            backend="cute" if head_dim == 512 else "triton",
+        )
     else:
-        inner_attention_cls = SlidingWindowAttention
-    inner_attention_cfg = inner_attention_cls.Config(
-        window_size=window_size,
-        compress_ratio=compress_ratio,
-        softmax_scale=softmax_scale,
-        index_topk=index_topk,
-    )
+        inner_attention_cfg = SlidingWindowAttention.Config(
+            window_size=window_size,
+            compress_ratio=compress_ratio,
+            softmax_scale=softmax_scale,
+            index_topk=index_topk,
+        )
 
     return Attention.Config(
         dim=dim,
@@ -552,7 +563,9 @@ def _build_mtp_layers(
         if block_cfg.moe is not None:
             block_cfg.moe.router.gate.param_init = _depth_init(layer_id)
             block_cfg.moe.router.layer_id = layer_id
-            block_cfg.moe.routed_experts.inner_experts.param_init = _depth_experts_init(layer_id)
+            block_cfg.moe.routed_experts.inner_experts.param_init = _depth_experts_init(
+                layer_id
+            )
             if block_cfg.moe.shared_experts is not None:
                 depth_init = _depth_init(layer_id)
                 block_cfg.moe.shared_experts.w2.param_init = depth_init
@@ -723,7 +736,6 @@ def _debugmodel(
         n_mtp_layers=n_mtp_layers,
         mtp_layers=(
             _build_mtp_layers(
-                # pyrefly: ignore [bad-argument-type]
                 layers[-1],
                 dim=dim,
                 num_mtp_layers=n_mtp_layers,
@@ -855,7 +867,6 @@ def _deepseek_v4_flash(
         n_mtp_layers=n_mtp_layers,
         mtp_layers=(
             _build_mtp_layers(
-                # pyrefly: ignore [bad-argument-type]
                 layers[-1],
                 dim=dim,
                 num_mtp_layers=n_mtp_layers,
@@ -987,7 +998,6 @@ def _deepseek_v4_pro(
         n_mtp_layers=n_mtp_layers,
         mtp_layers=(
             _build_mtp_layers(
-                # pyrefly: ignore [bad-argument-type]
                 layers[-1],
                 dim=dim,
                 num_mtp_layers=n_mtp_layers,

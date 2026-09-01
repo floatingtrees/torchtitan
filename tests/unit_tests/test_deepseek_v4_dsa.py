@@ -4,154 +4,234 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU tests for the DeepSeek-V4 DSA attention core.
-
-The DSA core expresses the fixed patterns (sliding window, compress-block
-causality) as a ``mask_mod`` predicate and only the CSA top-k selection as
-indices. These tests verify that the resulting attended (q, kv) pairs match
-the previous index-based formulation for every compression ratio.
-"""
-
 import unittest
 
 import torch
-from torch.nn.attention.flex_attention import BlockMask
+from attn_gym.sparse.selected_attention import selected_attention
 
-from torchtitan.models.deepseek_v4.attention import DSV4FlexAttention
+from torchtitan.models.deepseek_v4 import deepseek_v4_configs
+from torchtitan.models.deepseek_v4.attention import (
+    _indexer_loss,
+    _InjectAuxLoss,
+    CompressedSparseAttention,
+)
 from torchtitan.models.deepseek_v4.compressor import Indexer
 
 
-def window_idxs(window_size, bsz, seqlen, device):
-    window = min(seqlen, window_size)
-    base = torch.arange(seqlen, device=device).unsqueeze(1)
-    idxs = (base - window + 1).clamp(0) + torch.arange(window, device=device)
-    idxs = torch.where(idxs > base, -1, idxs)
-    return idxs.unsqueeze(0).expand(bsz, -1, -1)
+def _reference_indexer_loss(query, compressed_kv, lse, indexer_logits, valid):
+    scale = query.shape[-1] ** -0.5
+    eps = torch.finfo(torch.float32).tiny
+    losses = []
+    for batch_idx in range(query.shape[0]):
+        for token_idx in range(query.shape[2]):
+            row_valid = valid[batch_idx, token_idx]
+            if not row_valid.any():
+                continue
+            masses = []
+            for selected_idx in range(compressed_kv.shape[2]):
+                mass = query.new_zeros(())
+                if row_valid[selected_idx]:
+                    for head_idx in range(query.shape[1]):
+                        score = torch.dot(
+                            query[batch_idx, head_idx, token_idx].float(),
+                            compressed_kv[batch_idx, token_idx, selected_idx].float(),
+                        )
+                        mass = mass + torch.exp(
+                            score * scale - lse[batch_idx, head_idx, token_idx].float()
+                        )
+                masses.append(mass)
+            masses = torch.stack(masses)
+            teacher = masses / masses.sum().clamp_min(eps)
+            student_log_probs = torch.log_softmax(
+                indexer_logits[batch_idx, token_idx, row_valid].float(), dim=0
+            )
+            teacher_valid = teacher[row_valid]
+            losses.append(
+                (
+                    teacher_valid
+                    * (teacher_valid.clamp_min(eps).log() - student_log_probs)
+                ).sum()
+            )
+    return torch.stack(losses).mean()
 
 
-def compress_idxs(ratio, bsz, seqlen, device, offset):
-    """Old HCA index formulation: causal compressed positions + offset."""
-    compress_len = seqlen // ratio
-    if compress_len == 0:
-        return torch.empty((bsz, seqlen, 0), dtype=torch.int64, device=device)
-    idxs = torch.arange(compress_len, device=device).repeat(seqlen, 1)
-    causal_limit = torch.arange(1, seqlen + 1, device=device).unsqueeze(1)
-    causal_limit = causal_limit // ratio
-    idxs = torch.where(idxs >= causal_limit, -1, idxs + offset)
-    return idxs.unsqueeze(0).expand(bsz, -1, -1)
-
-
-def old_indexer_topk(bsz, seqlen, ratio, topk, device, seed):
-    """Old CSA top-k selection: causal-masked scores, then topk + offset."""
-    g = torch.Generator(device).manual_seed(seed)
-    scores = torch.randn(bsz, seqlen, seqlen // ratio, generator=g, device=device)
-    causal_limit = torch.arange(1, seqlen + 1, device=device).unsqueeze(1) // ratio
-    mask = torch.arange(seqlen // ratio, device=device).repeat(seqlen, 1)
-    mask = mask >= causal_limit
-    scores = scores + torch.where(mask, torch.finfo(torch.float32).min, 0)
-    _, topk_idxs = scores.topk(min(topk, seqlen // ratio), dim=-1)
-    topk_idxs = torch.where(topk_idxs >= causal_limit, -1, topk_idxs)
-    return topk_idxs
-
-
-def old_attended(topk_idxs, sink_idx):
-    """Attended kv positions per (b, q) from the old index formulation."""
-    out = []
-    for b in range(topk_idxs.size(0)):
-        for q in range(topk_idxs.size(1)):
-            s = {int(i) for i in topk_idxs[b, q] if i >= 0}
-            s.add(sink_idx)
-            out.append(s)
-    return out
-
-
-def new_attended(block_mask, seqlen, n_cmp):
-    """Attended kv positions per (b, q) from the new block mask's mask_mod."""
-    kv_len = seqlen + n_cmp + 1
-    B = block_mask.kv_num_blocks.size(0)
-    out = []
-    for b in range(B):
-        q_idx = torch.arange(seqlen).unsqueeze(0).unsqueeze(-1)
-        kv_idx = torch.arange(kv_len).unsqueeze(0).unsqueeze(-2)
-        m = block_mask.mask_mod(torch.tensor(b), torch.tensor(0), q_idx, kv_idx)
-        m = m[0]
-        for q in range(seqlen):
-            out.append(set(m[q].nonzero().flatten().tolist()))
-    return out
-
-
-def build_dsa(ratio, window_size, block_size=128):
-    cfg = DSV4FlexAttention.Config(
-        block_size=block_size,
-        window_size=window_size,
-        compress_ratio=ratio,
-        softmax_scale=0.1,
-        index_topk=16,
-    )
-    return DSV4FlexAttention(cfg)
-
-
-class TestDSABlockMask(unittest.TestCase):
-    def test_attended_sets_match_old_formulation(self):
+class TestDeepSeekV4SelectedAttention(unittest.TestCase):
+    def test_indexer_select_returns_indices_and_gathered_logits(self):
         torch.manual_seed(0)
-        device = torch.device("cpu")
-        bsz, seqlen, window_size = 2, 512, 16
-        for ratio, topk in [(0, 0), (1, 0), (4, 16), (128, 0)]:
-            n_cmp = seqlen // ratio if ratio > 1 else 0
-            sink_idx = seqlen + n_cmp
-            with self.subTest(ratio=ratio):
-                if ratio == 4:
-                    topk_sel = old_indexer_topk(bsz, seqlen, ratio, topk, device, 7)
-                    compress = torch.where(topk_sel < 0, -1, topk_sel + seqlen)
-                elif ratio > 1:
-                    topk_sel = None
-                    compress = compress_idxs(ratio, bsz, seqlen, device, seqlen)
-                else:
-                    topk_sel = None
-                    compress = torch.empty(
-                        (bsz, seqlen, 0), dtype=torch.int64, device=device
-                    )
-                win = window_idxs(window_size, bsz, seqlen, device)
-                topk_idxs = (
-                    torch.cat([win, compress], dim=-1) if compress.size(-1) else win
-                )
+        seqlen, ratio, topk = 12, 3, 3
+        idx_q = torch.randn(seqlen, 2, 4)
+        idx_k = torch.randn(seqlen // ratio, 4)
+        idx_w = torch.randn(seqlen, 2)
 
-                dsa = build_dsa(ratio, window_size)
-                bm = dsa._build_block_mask(bsz, seqlen, n_cmp, topk_sel, device)
-                self.assertIsInstance(bm, BlockMask)
-                expected = old_attended(topk_idxs, sink_idx)
-                actual = new_attended(bm, seqlen, n_cmp)
-                self.assertEqual(expected, actual)
-
-    def test_indexer_select_matches_old_topk(self):
-        torch.manual_seed(0)
-        device = torch.device("cpu")
-        bsz, seqlen, ratio, topk = 2, 512, 4, 16
-        n_cmp = seqlen // ratio
-        g = torch.Generator(device).manual_seed(11)
-        idx_q = torch.randn(bsz, seqlen, 8, 32, generator=g, device=device)
-        idx_k = torch.randn(bsz, n_cmp, 32, generator=g, device=device)
-        idx_w = torch.randn(bsz, seqlen, 8, generator=g, device=device)
-
-        selected = Indexer.select(
-            idx_q, idx_k, idx_w, seqlen=seqlen, ratio=ratio, topk=topk
+        indices, selected_logits = Indexer.select(
+            idx_q,
+            idx_k,
+            idx_w,
+            seqlen=seqlen,
+            ratio=ratio,
+            topk=topk,
         )
 
-        # Old formulation: causal-masked scores -> topk -> map invalid to -1.
-        scores = torch.einsum("bshd,btd->bsht", idx_q, idx_k)
-        scores = scores.relu_() * idx_w.unsqueeze(-1)
-        scores = scores.sum(dim=2)
-        causal_limit = torch.arange(1, seqlen + 1, device=device).unsqueeze(1) // ratio
-        mask = torch.arange(n_cmp, device=device).repeat(seqlen, 1) >= causal_limit
-        scores = scores + torch.where(mask, torch.finfo(idx_q.dtype).min, 0)
-        _, topk_idxs = scores.topk(min(topk, n_cmp), dim=-1)
-        old = torch.where(topk_idxs >= causal_limit, -1, topk_idxs)
+        scores = torch.einsum("shd,td->sht", idx_q, idx_k)
+        scores = torch.relu(scores) * idx_w.unsqueeze(-1)
+        scores = scores.sum(dim=1)
+        causal_limit = torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
+        causal_mask = torch.arange(seqlen // ratio).expand(seqlen, -1) >= causal_limit
+        scores = scores.masked_fill(causal_mask, torch.finfo(scores.dtype).min)
+        expected_logits, expected_indices = scores.topk(topk, dim=-1)
 
-        # Valid (non-masked) entries must agree exactly; the new formulation
-        # keeps raw indices and gates causality in the mask instead of -1.
-        self.assertEqual(selected.shape, (bsz, seqlen, topk))
-        self.assertTrue((selected >= 0).all())
-        self.assertTrue(torch.equal(selected.masked_fill(old < 0, -1), old))
+        self.assertTrue(torch.equal(indices, expected_indices))
+        torch.testing.assert_close(selected_logits, expected_logits, rtol=0, atol=0)
+        torch.testing.assert_close(
+            selected_logits,
+            scores.gather(-1, indices),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_indexer_loss_value_and_gradient_contract(self):
+        torch.manual_seed(1)
+        query = torch.randn(1, 2, 3, 4, requires_grad=True)
+        compressed_kv = torch.randn(1, 3, 3, 4, requires_grad=True)
+        lse = (torch.randn(1, 2, 3) + 3).requires_grad_()
+        indexer_logits = torch.randn(1, 3, 3, requires_grad=True)
+        valid = torch.tensor(
+            [[[False, False, False], [True, True, False], [True, True, True]]]
+        )
+        reference_logits = indexer_logits.detach().clone().requires_grad_()
+
+        actual = _indexer_loss(query, compressed_kv, lse, indexer_logits, valid)
+        expected = _reference_indexer_loss(
+            query.detach(),
+            compressed_kv.detach(),
+            lse.detach(),
+            reference_logits,
+            valid,
+        )
+        actual.backward()
+        expected.backward()
+
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            indexer_logits.grad, reference_logits.grad, rtol=1e-5, atol=1e-6
+        )
+        self.assertIsNone(query.grad)
+        self.assertIsNone(compressed_kv.grad)
+        self.assertIsNone(lse.grad)
+        indexer_grad = indexer_logits.grad
+        assert indexer_grad is not None
+        self.assertGreater(indexer_grad.norm().item(), 0)
+        self.assertTrue(torch.equal(indexer_grad[~valid], torch.zeros(4)))
+
+    def test_aux_loss_injection_matches_explicit_objective(self):
+        torch.manual_seed(2)
+        carrier = torch.randn(3, 4, requires_grad=True)
+        aux_loss = torch.randn((), requires_grad=True)
+        reference_carrier = carrier.detach().clone().requires_grad_()
+        reference_aux_loss = aux_loss.detach().clone().requires_grad_()
+
+        result = _InjectAuxLoss.apply(carrier, aux_loss)
+        torch.testing.assert_close(result, carrier, rtol=0, atol=0)
+        result.sum().backward()
+        (reference_carrier.sum() + reference_aux_loss).backward()
+
+        torch.testing.assert_close(carrier.grad, reference_carrier.grad)
+        torch.testing.assert_close(aux_loss.grad, reference_aux_loss.grad)
+
+    def test_eager_csa_matches_selected_attention_forward_and_backward(self):
+        torch.manual_seed(3)
+        seqlen, num_heads, head_dim = 8, 2, 4
+        ratio, topk, window_size = 2, 2, 3
+        num_compressed = seqlen // ratio
+        module = CompressedSparseAttention.Config(
+            window_size=window_size,
+            compress_ratio=ratio,
+            softmax_scale=head_dim**-0.5,
+            index_topk=topk,
+            backend="eager",
+        ).build()
+
+        q = torch.randn(seqlen, num_heads, head_dim, requires_grad=True)
+        local_kv = torch.randn(seqlen, head_dim, requires_grad=True)
+        compressed_kv = torch.randn(num_compressed, head_dim, requires_grad=True)
+        idx_q = (torch.rand(seqlen, 3, 4) + 0.2).requires_grad_()
+        idx_k = (torch.rand(num_compressed, 4) + 0.2).requires_grad_()
+        idx_w = (torch.rand(seqlen, 3) + 0.2).requires_grad_()
+        sink = torch.randn(num_heads, requires_grad=True)
+        reference_q = q.detach().clone().requires_grad_()
+        reference_local_kv = local_kv.detach().clone().requires_grad_()
+        reference_compressed_kv = compressed_kv.detach().clone().requires_grad_()
+        reference_sink = sink.detach().clone().requires_grad_()
+
+        output = module(
+            q,
+            local_kv,
+            compressed_kv,
+            idx_q,
+            idx_k,
+            idx_w,
+            sink,
+        )
+        raw_indices, _ = Indexer.select(
+            idx_q.detach(),
+            idx_k.detach(),
+            idx_w.detach(),
+            seqlen=seqlen,
+            ratio=ratio,
+            topk=topk,
+        )
+        causal_limit = torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
+        causal_indices = torch.where(raw_indices < causal_limit, raw_indices, -1)
+        reference_output = (
+            selected_attention(
+                reference_q.transpose(0, 1).unsqueeze(0),
+                reference_local_kv.unsqueeze(0).unsqueeze(0),
+                reference_compressed_kv.unsqueeze(0).unsqueeze(0),
+                causal_indices.unsqueeze(0),
+                reference_sink,
+                None,
+                window_size,
+                backend="eager",
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+        )
+
+        torch.testing.assert_close(output, reference_output, rtol=0, atol=0)
+        output_weight = torch.randn_like(output)
+        (output * output_weight).sum().backward()
+        (reference_output * output_weight).sum().backward()
+
+        for actual, expected in (
+            (q, reference_q),
+            (local_kv, reference_local_kv),
+            (compressed_kv, reference_compressed_kv),
+            (sink, reference_sink),
+        ):
+            torch.testing.assert_close(actual.grad, expected.grad, rtol=1e-5, atol=1e-6)
+        for feature in (idx_q, idx_k, idx_w):
+            feature_grad = feature.grad
+            assert feature_grad is not None
+            self.assertGreater(feature_grad.norm().item(), 0)
+            self.assertTrue(torch.isfinite(feature_grad).all())
+
+    def test_model_configs_select_backend_by_head_dim(self):
+        debug_config = deepseek_v4_configs["debugmodel"]()
+        flash_config = deepseek_v4_configs["deepseek_v4_flash"]()
+        debug_backends = [
+            layer.attention.inner_attention.backend
+            for layer in debug_config.layers
+            if layer.attention.compress_ratio > 1
+        ]
+        flash_backends = [
+            layer.attention.inner_attention.backend
+            for layer in flash_config.layers
+            if layer.attention.compress_ratio > 1
+        ]
+
+        self.assertEqual(debug_backends, ["triton", "triton"])
+        self.assertTrue(flash_backends)
+        self.assertEqual(set(flash_backends), {"cute"})
 
 
 if __name__ == "__main__":

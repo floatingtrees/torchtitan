@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 import spmd_types as spmd
 import torch
+import torch.nn.functional as F
+from attn_gym.sparse.selected_attention import AuxRequest, selected_attention
 from torch.nn.attention.flex_attention import BlockMask
 
 from torchtitan.distributed.utils import get_spmd_backend
@@ -29,36 +31,6 @@ def _assert_spmd_attention_type(tensor, *, tp):
 
 
 class DSV4FlexAttention(FlexAttention):
-    """DeepSeek sparse attention core for DeepSeek-V4.
-
-    The core attends over the concatenated KV sequence ``[0, L + n_cmp + 1)``,
-    where the first ``L`` positions are the uncompressed sliding-window KV
-    (``swa_k``), the next ``n_cmp`` positions are the compressed KV
-    (``cmp_k``), and the last position is a learned attention sink token:
-
-    - sliding window: fixed pattern over ``swa_k``, expressed as a
-      ``mask_mod`` predicate (no indices);
-    - compressed blocks: for HCA (``compress_ratio=128``) all causal blocks
-      are attendable, also a fixed ``mask_mod`` pattern; for CSA
-      (``compress_ratio=4``) each query attends only its top-k selected
-      compressed positions, which is the only dynamic (index-based) part;
-    - attention sink: always attendable via ``score_mod``.
-
-    The ``mask_mod`` is evaluated at token granularity inside flex_attention;
-    the per-query-block KV block listing (``BlockMask.from_kv_blocks``) only
-    restricts which blocks the kernel loads.
-
-    Overrides can replace ``_build_block_mask`` (e.g. NPU varlen kernels) or
-    the whole ``forward`` (e.g. fused SMLA/CSA kernels, which consume the raw
-    ``q / swa_k / cmp_k / idx_q / idx_k / idx_w`` tensors). Under context
-    parallelism, all-gathering ``idx_k`` and ``cmp_k`` at this module boundary
-    enables global sparse selection.
-
-    TODO: the indexer auxiliary loss is intentionally dropped for now; it will
-    be re-added as a carrier-injected aux loss (see the NPU fork) once the
-    general aux-loss mechanism lands.
-    """
-
     @dataclass(kw_only=True, slots=True)
     class Config(FlexAttention.Config):
         window_size: int
@@ -69,9 +41,7 @@ class DSV4FlexAttention(FlexAttention):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self.window_size = config.window_size
-        self.compress_ratio = config.compress_ratio
         self.softmax_scale = config.softmax_scale
-        self.index_topk = config.index_topk
         self.block_size = config.block_size
 
     def get_window_topk_idxs(
@@ -94,40 +64,9 @@ class DSV4FlexAttention(FlexAttention):
         """
         window = min(seqlen, self.window_size)
         q_idx = torch.arange(seqlen, device=device).unsqueeze(1)
-        idxs = (q_idx - window + 1).clamp_min(0) + torch.arange(
-            window, device=device
-        )
+        idxs = (q_idx - window + 1).clamp_min(0) + torch.arange(window, device=device)
         idxs = torch.where(idxs <= q_idx, idxs, -1)
         return idxs.unsqueeze(0).expand(bsz, -1, -1)
-
-    def get_compress_topk_idxs(
-        self,
-        *,
-        bsz: int,
-        seqlen: int,
-        n_cmp: int,
-        device,
-    ) -> torch.Tensor:
-        """Return causal compressed KV indices in the concatenated KV space.
-
-        Args:
-            bsz: Batch size.
-            seqlen: Query sequence length and uncompressed KV length.
-            n_cmp: Number of compressed KV tokens.
-            device: Device used for the generated index tensor.
-
-        Returns:
-            Tensor of shape ``[B, L, n_cmp]``. Valid entries are compressed KV
-            positions offset by ``seqlen`` and padded entries are ``-1``.
-        """
-        if n_cmp == 0:
-            return torch.empty((bsz, seqlen, 0), dtype=torch.int64, device=device)
-
-        cmp_idx = torch.arange(n_cmp, device=device).repeat(seqlen, 1)
-        causal_limit = torch.arange(1, seqlen + 1, device=device).unsqueeze(1)
-        causal_limit = causal_limit // self.compress_ratio
-        cmp_idx = torch.where(cmp_idx < causal_limit, seqlen + cmp_idx, -1)
-        return cmp_idx.unsqueeze(0).expand(bsz, -1, -1)
 
     def _build_block_mask(
         self,
@@ -199,13 +138,8 @@ class DSV4FlexAttention(FlexAttention):
         swa_k,
         attn_sink,
         *,
-        cmp_k=None,
-        idx_q=None,
-        idx_k=None,
-        idx_w=None,
         attention_masks=None,
     ) -> torch.Tensor:
-        """Run DSV4 sparse attention over a folded token stream."""
         if attention_masks is not None:
             raise ValueError(
                 "DSV4FlexAttention does not accept attention_masks; "
@@ -215,12 +149,9 @@ class DSV4FlexAttention(FlexAttention):
             raise ValueError("DSV4FlexAttention requires attn_sink")
 
         seqlen, _, head_dim = q.size()
-        n_cmp = 0 if cmp_k is None else cmp_k.size(0)
-        sink_idx = seqlen + n_cmp
+        sink_idx = seqlen
 
         kv = swa_k.unsqueeze(1)
-        if cmp_k is not None:
-            kv = torch.cat([kv, cmp_k.unsqueeze(1)], dim=0)
         sink_kv = kv.new_zeros((1, 1, head_dim))
         kv = torch.cat([kv, sink_kv], dim=0)
         kv = kv.expand(-1, q.size(1), -1)
@@ -229,34 +160,6 @@ class DSV4FlexAttention(FlexAttention):
             selected_indices = [
                 self.get_window_topk_idxs(bsz=1, seqlen=seqlen, device=q.device)
             ]
-            if self.compress_ratio == 4:
-                if idx_q is None or idx_k is None or idx_w is None:
-                    raise ValueError(
-                        "DSV4FlexAttention requires idx_q, idx_k, "
-                        "and idx_w when compress_ratio=4"
-                    )
-                cmp_topk = Indexer.select(
-                    idx_q,
-                    idx_k,
-                    idx_w,
-                    seqlen=seqlen,
-                    ratio=self.compress_ratio,
-                    topk=self.index_topk,
-                ).unsqueeze(0)
-                causal_limit = (
-                    torch.arange(1, seqlen + 1, device=q.device).unsqueeze(1)
-                    // self.compress_ratio
-                )
-                cmp_topk = torch.where(
-                    cmp_topk < causal_limit.unsqueeze(0), seqlen + cmp_topk, -1
-                )
-                selected_indices.append(cmp_topk)
-            elif self.compress_ratio > 1:
-                selected_indices.append(
-                    self.get_compress_topk_idxs(
-                        bsz=1, seqlen=seqlen, n_cmp=n_cmp, device=q.device
-                    )
-                )
             sink_indices = torch.full(
                 (1, seqlen, 1), sink_idx, dtype=torch.int64, device=q.device
             )
@@ -301,9 +204,133 @@ class SlidingWindowAttention(DSV4FlexAttention):
         )
 
 
-class HeavilyCompressedAttention(DSV4FlexAttention):
+class _InjectAuxLoss(torch.autograd.Function):
+    @staticmethod
+    def forward(*args, **kwargs):
+        ctx, carrier, aux_loss = args
+        ctx.save_for_backward(aux_loss)
+        return carrier
+
+    @staticmethod
+    def backward(*args, **kwargs):
+        ctx, grad_output = args
+        (aux_loss,) = ctx.saved_tensors
+        return grad_output, torch.ones_like(aux_loss)
+
+
+def _indexer_loss(
+    main_query_BNTD,
+    selected_compressed_kv_BTKD,
+    attention_lse_BNT,
+    selected_indexer_logits_BTK,
+    selected_is_valid_BTK,
+):
+    compressed_attention_logits_BNTK = (
+        torch.einsum(
+            "bntd,btkd->bntk",
+            main_query_BNTD.detach().float(),
+            selected_compressed_kv_BTKD.detach().float(),
+        )
+        * main_query_BNTD.shape[-1] ** -0.5
+    )
+    compressed_teacher_mass_BTK = torch.exp(
+        compressed_attention_logits_BNTK - attention_lse_BNT.detach().float()[..., None]
+    ).sum(dim=1)
+    valid_BTK = selected_is_valid_BTK.float()
+    compressed_teacher_mass_BTK = compressed_teacher_mass_BTK * valid_BTK
+    eps = torch.finfo(torch.float32).tiny
+    compressed_teacher_probs_BTK = (
+        compressed_teacher_mass_BTK
+        / compressed_teacher_mass_BTK.sum(dim=-1, keepdim=True).clamp_min(eps)
+    ).detach()
+    masked_indexer_logits_BTK = selected_indexer_logits_BTK.float().masked_fill(
+        ~selected_is_valid_BTK, float("-inf")
+    )
+    row_has_valid_BT = selected_is_valid_BTK.any(dim=-1)
+    masked_indexer_logits_BTK = torch.where(
+        row_has_valid_BT[..., None],
+        masked_indexer_logits_BTK,
+        torch.zeros_like(masked_indexer_logits_BTK),
+    )
+    indexer_probs_BTK = F.softmax(masked_indexer_logits_BTK, dim=-1)
+    kl_BT = (
+        compressed_teacher_probs_BTK
+        * (
+            compressed_teacher_probs_BTK.clamp_min(eps).log()
+            - indexer_probs_BTK.clamp_min(eps).log()
+        )
+    ).sum(dim=-1)
+    valid_kl_BT = torch.where(row_has_valid_BT, kl_BT, torch.zeros_like(kl_BT))
+    return valid_kl_BT.sum() / row_has_valid_BT.sum().clamp_min(1)
+
+
+class DSV4SelectedAttention(Module):
     @dataclass(kw_only=True, slots=True)
-    class Config(DSV4FlexAttention.Config):
+    class Config(Module.Config):
+        window_size: int
+        compress_ratio: int
+        softmax_scale: float
+        index_topk: int
+        backend: str
+
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.window_size = config.window_size
+        self.compress_ratio = config.compress_ratio
+        self.index_topk = config.index_topk
+        self.backend = config.backend
+
+    def _forward_selected(
+        self,
+        q,
+        swa_k,
+        cmp_k,
+        kv_indices,
+        attn_sink,
+        *,
+        return_lse,
+    ):
+        q_BNTD = q.transpose(0, 1).unsqueeze(0)
+        swa_k_BNTD = swa_k.unsqueeze(0).unsqueeze(0)
+        cmp_k_BNCD = cmp_k.unsqueeze(0).unsqueeze(0)
+        kv_indices_BTK = kv_indices.unsqueeze(0)
+        sink_N = None if self.backend == "cute" else attn_sink
+        if return_lse:
+            out_BNTD, aux = selected_attention(
+                q_BNTD,
+                swa_k_BNTD,
+                cmp_k_BNCD,
+                kv_indices_BTK,
+                sink_N,
+                None,
+                self.window_size,
+                backend=self.backend,
+                return_aux=AuxRequest(lse=True),
+            )
+            return out_BNTD, aux.lse
+        out_BNTD = selected_attention(
+            q_BNTD,
+            swa_k_BNTD,
+            cmp_k_BNCD,
+            kv_indices_BTK,
+            sink_N,
+            None,
+            self.window_size,
+            backend=self.backend,
+        )
+        return out_BNTD, None
+
+    @staticmethod
+    def _finish_output(out_BNTD, q):
+        out_TND = out_BNTD.squeeze(0).transpose(0, 1)
+        if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+            spmd.assert_type_like(out_TND, q)
+        return out_TND
+
+
+class HeavilyCompressedAttention(DSV4SelectedAttention):
+    @dataclass(kw_only=True, slots=True)
+    class Config(DSV4SelectedAttention.Config):
         pass
 
     def forward(
@@ -315,18 +342,37 @@ class HeavilyCompressedAttention(DSV4FlexAttention):
         *,
         attention_masks=None,
     ) -> torch.Tensor:
-        return self._forward_impl(
-            q,
-            swa_k,
-            attn_sink,
-            cmp_k=cmp_k,
-            attention_masks=attention_masks,
-        )
+        if attention_masks is not None:
+            raise ValueError(
+                "HeavilyCompressedAttention does not accept attention_masks"
+            )
+        with spmd.no_typecheck():
+            seqlen = q.shape[0]
+            num_compressed = cmp_k.shape[0]
+            kv_indices_TK = torch.arange(
+                num_compressed, device=q.device, dtype=torch.int64
+            ).expand(seqlen, -1)
+            causal_limit_T1 = (
+                torch.arange(1, seqlen + 1, device=q.device).unsqueeze(1)
+                // self.compress_ratio
+            )
+            kv_indices_TK = torch.where(
+                kv_indices_TK < causal_limit_T1, kv_indices_TK, -1
+            )
+            out_BNTD, _ = self._forward_selected(
+                q,
+                swa_k,
+                cmp_k,
+                kv_indices_TK,
+                attn_sink,
+                return_lse=False,
+            )
+        return self._finish_output(out_BNTD, q)
 
 
-class CompressedSparseAttention(DSV4FlexAttention):
+class CompressedSparseAttention(DSV4SelectedAttention):
     @dataclass(kw_only=True, slots=True)
-    class Config(DSV4FlexAttention.Config):
+    class Config(DSV4SelectedAttention.Config):
         pass
 
     def forward(
@@ -341,16 +387,44 @@ class CompressedSparseAttention(DSV4FlexAttention):
         *,
         attention_masks=None,
     ) -> torch.Tensor:
-        return self._forward_impl(
-            q,
-            swa_k,
-            attn_sink,
-            cmp_k=cmp_k,
-            idx_q=idx_q,
-            idx_k=idx_k,
-            idx_w=idx_w,
-            attention_masks=attention_masks,
-        )
+        if attention_masks is not None:
+            raise ValueError(
+                "CompressedSparseAttention does not accept attention_masks"
+            )
+        with spmd.no_typecheck():
+            seqlen = q.shape[0]
+            kv_indices_TK, selected_indexer_logits_TK = Indexer.select(
+                idx_q,
+                idx_k,
+                idx_w,
+                seqlen=seqlen,
+                ratio=self.compress_ratio,
+                topk=self.index_topk,
+            )
+            causal_limit_T1 = (
+                torch.arange(1, seqlen + 1, device=q.device).unsqueeze(1)
+                // self.compress_ratio
+            )
+            selected_is_valid_TK = kv_indices_TK < causal_limit_T1
+            selected_compressed_kv_TKD = cmp_k[kv_indices_TK]
+            causal_kv_indices_TK = torch.where(selected_is_valid_TK, kv_indices_TK, -1)
+            out_BNTD, attention_lse_BNT = self._forward_selected(
+                q,
+                swa_k,
+                cmp_k,
+                causal_kv_indices_TK,
+                attn_sink,
+                return_lse=True,
+            )
+            aux_loss = _indexer_loss(
+                q.transpose(0, 1).unsqueeze(0),
+                selected_compressed_kv_TKD.unsqueeze(0),
+                attention_lse_BNT,
+                selected_indexer_logits_TK.unsqueeze(0),
+                selected_is_valid_TK.unsqueeze(0),
+            )
+            out_BNTD = _InjectAuxLoss.apply(out_BNTD, aux_loss)
+        return self._finish_output(out_BNTD, q)
 
 
 class Attention(BaseAttention):
